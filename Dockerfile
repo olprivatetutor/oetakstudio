@@ -1,5 +1,5 @@
-# Use the official Node.js 18 image
-FROM node:18-alpine AS base
+# Next.js production runtime
+FROM node:20-alpine AS base
 
 # Install dependencies only when needed
 FROM base AS deps
@@ -16,9 +16,6 @@ FROM base AS builder
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
-
-# Generate Prisma/Drizzle client
-RUN npm run db:generate
 
 # Build the application
 RUN npm run build

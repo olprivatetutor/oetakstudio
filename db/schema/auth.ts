@@ -1,4 +1,4 @@
-import { pgTable, text, timestamp, boolean } from "drizzle-orm/pg-core";
+import { pgTable, text, timestamp, boolean, integer, uniqueIndex } from "drizzle-orm/pg-core";
 
 export const user = pgTable("user", {
     id: text("id").primaryKey(),
@@ -8,6 +8,7 @@ export const user = pgTable("user", {
         .$defaultFn(() => false)
         .notNull(),
     image: text("image"),
+    twoFactorEnabled: boolean("two_factor_enabled").default(false).notNull(),
     createdAt: timestamp("created_at")
         .$defaultFn(() => /* @__PURE__ */ new Date())
         .notNull(),
@@ -59,3 +60,18 @@ export const verification = pgTable("verification", {
         () => /* @__PURE__ */ new Date(),
     ),
 });
+
+export const rateLimit = pgTable("rate_limit", {
+    key: text("key").primaryKey(),
+    count: integer("count").notNull(),
+    lastRequest: integer("last_request").notNull(),
+});
+
+export const twoFactor = pgTable("two_factor", {
+    id: text("id").primaryKey(),
+    secret: text("secret").notNull(),
+    backupCodes: text("backup_codes").notNull(),
+    userId: text("user_id")
+        .notNull()
+        .references(() => user.id, { onDelete: "cascade" }),
+}, (table) => [uniqueIndex("two_factor_user_unique").on(table.userId)]);

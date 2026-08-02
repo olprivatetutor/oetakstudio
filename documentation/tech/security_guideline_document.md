@@ -28,7 +28,7 @@ This document defines mandatory security principles and implementation best prac
 - Introduce exponential backoff or temporary lockout after N failed attempts.
 
 ### 2.4 Role-Based Access Control (Future)
-- Define user roles in your database model (e.g., `role = 'user' | 'admin'`).
+- Define user roles in your database model (e.g., global app roles and organization-scoped roles).
 - Enforce server-side authorization checks in every protected route (e.g., in `dashboard/layout.tsx` loader functions).
 
 ---
