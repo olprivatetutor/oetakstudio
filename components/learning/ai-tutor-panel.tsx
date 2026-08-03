@@ -33,7 +33,7 @@ export function AiTutorPanel({ courseId, moduleId }: { courseId: string; moduleI
     setIsLoading(true);
 
     try {
-      const response = await fetch("/api/ai/tutor", {
+      const response = await fetch("/api/v1/ai/tutor/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ courseId, moduleId, conversationId, message }),

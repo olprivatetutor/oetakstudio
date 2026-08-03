@@ -66,6 +66,9 @@ All route handlers validate input with Zod and return `{ success, data, message 
 - `POST /api/v1/content/generate`
 - `GET /api/v1/content/generate/:jobId`
 - `POST /api/v1/ai/tutor/chat`
+- `GET /api/v1/ai/tutor/sessions`
+- `GET /api/v1/ai/tutor/sessions/:sessionId`
+- `POST /api/v1/ai/tutor/sessions/:sessionId/close`
 - `GET|POST /api/v1/organizations/:organizationId/members`
 - `PATCH|DELETE /api/v1/organizations/:organizationId/members/:userId`
 - `POST /api/v1/organizations/invitations/accept`
