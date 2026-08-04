@@ -20,14 +20,19 @@ Oetak is a multi-tenant AI learning application built with Next.js App Router, R
 cp .env.example .env
 npm ci
 npm run db:dev
-npm run db:migrate
-npm run db:seed
+npm run db:bootstrap
 npm run dev
 ```
 
 Open `http://localhost:3000`. The development database listens on `localhost:5433` by default.
 
 Real email, billing, speech, and AI requests require the matching provider keys in `.env`. `LLM_PROVIDER` selects the primary text provider and `LLM_FALLBACK_PROVIDERS` accepts a comma-separated fallback order. There is no mock-provider fallback.
+
+### Seeded development sign-in
+
+Demo credentials do not exist until `npm run db:bootstrap` (or `npm run db:seed` after migrations) completes against the same `DATABASE_URL` used by the application. For the SMA Merdeka scenario, sign in with `owner.sma-merdeka@oetakstudio.local` and the default password `Scenario@2026!`. If `SCENARIO_1_PASSWORD` was set when the seed ran, use that value instead. Re-run `npm run db:seed` to restore the configured seed password; the seed is idempotent and updates credential hashes.
+
+An `Invalid email or password` response for a seeded address normally means the database was not seeded, the app and seed commands used different database URLs, or the password was overridden in the environment. Do not use these development credentials in production.
 
 ## Commands
 
@@ -66,6 +71,9 @@ All route handlers validate input with Zod and return `{ success, data, message 
 - `POST /api/v1/content/generate`
 - `GET /api/v1/content/generate/:jobId`
 - `POST /api/v1/ai/tutor/chat`
+- `GET /api/v1/ai/tutor/sessions`
+- `GET /api/v1/ai/tutor/sessions/:sessionId`
+- `POST /api/v1/ai/tutor/sessions/:sessionId/close`
 - `GET|POST /api/v1/organizations/:organizationId/members`
 - `PATCH|DELETE /api/v1/organizations/:organizationId/members/:userId`
 - `POST /api/v1/organizations/invitations/accept`

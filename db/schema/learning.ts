@@ -696,6 +696,8 @@ export const aiConversations = pgTable(
   },
   (table) => [
     index("ai_conversations_user_idx").on(table.userId),
+    index("ai_conversations_user_created_idx").on(table.userId, table.createdAt),
+    index("ai_conversations_user_status_idx").on(table.userId, table.status),
     index("ai_conversations_org_idx").on(table.organizationId),
     index("ai_conversations_course_idx").on(table.courseId),
   ],

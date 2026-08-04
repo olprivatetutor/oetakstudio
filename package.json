@@ -11,6 +11,7 @@
     "db:push": "drizzle-kit push",
     "db:pull": "drizzle-kit pull",
     "db:migrate": "drizzle-kit migrate",
+    "db:bootstrap": "npm run db:migrate && npm run db:seed",
     "db:studio": "drizzle-kit studio",
     "db:up": "docker compose up postgres -d",
     "db:down": "docker compose down postgres",
