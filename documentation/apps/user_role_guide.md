@@ -355,6 +355,22 @@ Teacher tidak dapat membuat Platform Content Library kecuali juga diberi platfor
 
 ## Rekomendasi Alur Testing Per Role
 
+### Persiapan Akun Seed
+
+Sebelum login dengan akun skenario, jalankan `npm run db:bootstrap` dari root repository. Perintah ini menjalankan migrasi lalu mengisi akun seed pada `DATABASE_URL` yang aktif. Aplikasi dan perintah bootstrap harus menggunakan `DATABASE_URL` yang sama.
+
+Credential default untuk organisasi **SMA Merdeka Nusantara Demo** adalah:
+
+| Role | Email | Password default |
+| --- | --- | --- |
+| Owner | `owner.sma-merdeka@oetakstudio.local` | `Scenario@2026!` |
+| Admin | `admin.sma-merdeka@oetakstudio.local` | `Scenario@2026!` |
+| Teacher | `teacher.siti@oetakstudio.local` | `Scenario@2026!` |
+| Learner | `aisha.grade11@oetakstudio.local` | `Scenario@2026!` |
+| Guardian | `parent.aisha@oetakstudio.local` | `Scenario@2026!` |
+
+`SCENARIO_1_PASSWORD` mengganti password default untuk seluruh akun tersebut. Jika login gagal, jalankan kembali `npm run db:seed` dan pastikan nilai environment yang digunakan oleh aplikasi sama dengan terminal tempat seed dijalankan.
+
 ### Individual Learner
 
 1. Buat akun baru melalui `Sign Up`.
