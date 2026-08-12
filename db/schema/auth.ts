@@ -1,4 +1,14 @@
-import { pgTable, text, timestamp, boolean, integer, uniqueIndex } from "drizzle-orm/pg-core";
+import { pgTable, text, timestamp, boolean, integer, uniqueIndex, pgEnum, date } from "drizzle-orm/pg-core";
+
+// ADR-007 (app_summary.md §3.6): resolved from birth_date where provided, else a
+// self-declared band, else UNSPECIFIED. UNSPECIFIED fails closed as TEEN_13_17 for
+// AI safety-profile purposes (enforced by the safety-profile resolver, not here).
+export const ageBandEnum = pgEnum("age_band", [
+    "UNDER_13",
+    "TEEN_13_17",
+    "ADULT",
+    "UNSPECIFIED",
+]);
 
 export const user = pgTable("user", {
     id: text("id").primaryKey(),
@@ -9,6 +19,9 @@ export const user = pgTable("user", {
         .notNull(),
     image: text("image"),
     twoFactorEnabled: boolean("two_factor_enabled").default(false).notNull(),
+    // Minimized per §16.5: never exposed in list endpoints or analytics exports.
+    birthDate: date("birth_date"),
+    ageBand: ageBandEnum("age_band").default("UNSPECIFIED").notNull(),
     createdAt: timestamp("created_at")
         .$defaultFn(() => /* @__PURE__ */ new Date())
         .notNull(),

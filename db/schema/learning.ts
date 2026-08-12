@@ -11,6 +11,7 @@ import {
   uniqueIndex,
 } from "drizzle-orm/pg-core";
 import { user } from "@/db/schema/auth";
+import { workspaces } from "@/db/schema/workspace";
 import {
   ASSESSMENT_PURPOSES,
   CONTENT_TRACKS,
@@ -307,6 +308,37 @@ export const payments = pgTable(
   ],
 );
 
+export const paymentWebhookEventStatusEnum = pgEnum("payment_webhook_event_status", [
+  "received",
+  "processed",
+  "failed",
+  "ignored",
+]);
+
+export const paymentWebhookEvents = pgTable(
+  "payment_webhook_events",
+  {
+    id: idColumn().primaryKey(),
+    provider: text("provider").notNull(),
+    providerEventId: text("provider_event_id").notNull(),
+    eventType: text("event_type").notNull(),
+    signatureVerified: boolean("signature_verified").default(true).notNull(),
+    payload: jsonb("payload").$type<Record<string, unknown>>().notNull(),
+    status: paymentWebhookEventStatusEnum("status").default("received").notNull(),
+    processedAt: timestamp("processed_at"),
+    attemptCount: integer("attempt_count").default(1).notNull(),
+    lastError: text("last_error"),
+    ...timestampColumns,
+  },
+  (table) => [
+    uniqueIndex("payment_webhook_events_provider_event_unique").on(
+      table.provider,
+      table.providerEventId,
+    ),
+    index("payment_webhook_events_status_idx").on(table.status, table.createdAt),
+  ],
+);
+
 export const usageRecords = pgTable(
   "usage_records",
   {
@@ -348,6 +380,11 @@ export const organizations = pgTable(
   "organizations",
   {
     id: idColumn().primaryKey(),
+    // §4.4: an organization is business metadata attached 1:1 to an ORGANIZATION
+    // workspace. The workspace, not this table, is the tenant/security boundary.
+    workspaceId: text("workspace_id")
+      .notNull()
+      .references(() => workspaces.id, { onDelete: "restrict" }),
     name: text("name").notNull(),
     slug: text("slug").notNull(),
     description: text("description"),
@@ -366,6 +403,7 @@ export const organizations = pgTable(
   (table) => [
     uniqueIndex("organizations_slug_unique").on(table.slug),
     uniqueIndex("organizations_domain_unique").on(table.domain),
+    uniqueIndex("organizations_workspace_unique").on(table.workspaceId),
     index("organizations_owner_idx").on(table.ownerId),
   ],
 );

@@ -1,64 +1,136 @@
-# Claude Code Task Management Guide
+@AGENTS.md
 
-## Documentation Available
+# Claude Code Instructions
 
-📚 **Project Documentation**: Check the documentation files in this directory for project-specific setup instructions and guides.
-**Project Tasks**: Check the tasks directory in documentation/tasks for the list of tasks to be completed. Use the CLI commands below to interact with them.
+`app_summary.md` is the canonical product, domain, architecture, security, and implementation specification for Oetak Studio.
 
-## MANDATORY Task Management Workflow
+`AGENTS.md` contains the canonical coding-agent engineering rules.
 
-🚨 **YOU MUST FOLLOW THIS EXACT WORKFLOW - NO EXCEPTIONS** 🚨
+Both are binding. ADRs in `app_summary.md` take precedence over implementation convenience.
 
-### **STEP 1: DISCOVER TASKS (MANDATORY)**
-You MUST start by running this command to see all available tasks:
-```bash
-task-manager list-tasks
-```
+## Working Principles
 
-### **STEP 2: START EACH TASK (MANDATORY)**
-Before working on any task, you MUST mark it as started:
-```bash
-task-manager start-task <task_id>
-```
+Before making architectural, database, authorization, security, tenancy, AI, or cross-domain changes:
 
-### **STEP 3: COMPLETE OR CANCEL EACH TASK (MANDATORY)**
-After finishing implementation, you MUST mark the task as completed, or cancel if you cannot complete it:
-```bash
-task-manager complete-task <task_id> "Brief description of what was implemented"
-# or
-task-manager cancel-task <task_id> "Reason for cancellation"
-```
+1. Read the relevant sections of `app_summary.md`.
+2. Read and follow `AGENTS.md`.
+3. Inspect the existing implementation before proposing changes.
+4. Identify existing behavior that must be preserved.
+5. Produce a concise implementation plan for non-trivial changes.
+6. Prefer incremental changes over broad rewrites.
+7. Implement only the requested scope.
+8. Run relevant validation before declaring completion.
 
-## Task Files Location
+Do not invent missing business rules.
 
-📁 **Task Data**: Your tasks are organized in the `documentation/tasks/` directory:
-- Task JSON files contain complete task information
-- Use ONLY the `task-manager` commands listed above
-- Follow the mandatory workflow sequence for each task
+If the specification is ambiguous or conflicts with the existing implementation in a way that affects product behavior, security, data integrity, or architecture, surface the conflict before choosing a new rule.
 
-## MANDATORY Task Workflow Sequence
+## Scope Discipline
 
-🔄 **For EACH individual task, you MUST follow this sequence:**
+Respect capability classifications in `app_summary.md`:
 
-1. 📋 **DISCOVER**: `task-manager list-tasks` (first time only)
-2. 🚀 **START**: `task-manager start-task <task_id>` (mark as in progress)
-3. 💻 **IMPLEMENT**: Do the actual coding/implementation work
-4. ✅ **COMPLETE**: `task-manager complete-task <task_id> "What was done"` (or cancel with `task-manager cancel-task <task_id> "Reason"`)
-5. 🔁 **REPEAT**: Go to next task (start from step 2)
+* `[MVP]` — may be implemented when required by the current task.
+* `[READY]` — architecture/interface may exist, but do not build the full feature unless requested.
+* `[GROWTH]` — do not implement unless explicitly requested.
+* `[SCALE]` — do not implement unless explicitly requested.
 
-## Task Status Options
+Do not opportunistically implement future roadmap features.
 
-- `pending` - Ready to work on
-- `in_progress` - Currently being worked on  
-- `completed` - Successfully finished
-- `blocked` - Cannot proceed (waiting for dependencies)
-- `cancelled` - No longer needed
+## Architecture
 
-## CRITICAL WORKFLOW RULES
+Oetak Studio is a modular monolith unless the canonical specification explicitly says otherwise.
 
-❌ **NEVER skip** the `task-manager start-task` command
-❌ **NEVER skip** the `task-manager complete-task` command  (use `task-manager cancel-task` if a task is not planned, not required, or you must stop it)
-❌ **NEVER work on multiple tasks simultaneously**
-✅ **ALWAYS complete one task fully before starting the next**
-✅ **ALWAYS provide completion details in the complete command**
-✅ **ALWAYS follow the exact 3-step sequence: list → start → complete (or cancel if not required)**
+Preserve domain boundaries.
+
+Prefer:
+
+API / Route
+→ Application Service
+→ Domain Logic
+→ Repository
+→ Database
+
+Do not place significant business rules directly inside route handlers, React components, or raw database queries.
+
+Do not create microservices without an explicit architectural decision.
+
+## Database Changes
+
+Database changes must be migration-driven.
+
+For changes affecting existing data, prefer:
+
+expand
+→ backfill
+→ compatibility/cutover
+→ validate
+→ contract
+
+Avoid destructive migrations.
+
+Never remove legacy columns or tables until:
+
+* data has been migrated,
+* application reads/writes have moved,
+* tests pass,
+* and runtime dependencies have been verified.
+
+Use the `oetak-db-migration` skill for significant schema, RLS, tenancy, or migration work.
+
+## Authorization and Security
+
+Workspace is the tenant/security boundary.
+
+Authorization must consider:
+
+* authenticated identity,
+* workspace membership,
+* permission,
+* resource relationship,
+* domain rules,
+* PostgreSQL RLS.
+
+Never rely only on frontend visibility or application `WHERE workspace_id = ...` filtering for tenant isolation.
+
+Do not weaken RLS, authentication, authorization, minor safety, guardian controls, auditability, or AI safety to simplify implementation.
+
+## AI
+
+Business features depend on AI capabilities, not hardcoded provider names.
+
+Keep provider/model selection behind the AI provider abstraction.
+
+AI-generated educational content must remain reviewable according to the canonical workflow.
+
+Do not treat LLM self-reported confidence as authoritative system confidence.
+
+## Testing
+
+For every meaningful change, determine the smallest sufficient validation set.
+
+Depending on the change, run:
+
+* typecheck,
+* unit tests,
+* integration tests,
+* migration tests,
+* RLS isolation tests,
+* authorization tests,
+* E2E tests.
+
+Security-sensitive changes require negative-path tests.
+
+A feature is not complete merely because the happy path works.
+
+## Completion Report
+
+When finishing implementation, report:
+
+1. What changed.
+2. Important files changed.
+3. Migrations added or modified.
+4. Tests/validation executed.
+5. Remaining risks or follow-up work.
+6. Any deviation from `app_summary.md` or `AGENTS.md`.
+
+Do not claim tests passed unless they were actually executed successfully.

@@ -1,6 +1,12 @@
 import { and, asc, eq, inArray } from "drizzle-orm";
 import { db } from "@/db";
-import { invoices, organizationMembers, subscriptionPlans, subscriptions } from "@/db/schema/learning";
+import {
+  invoices,
+  organizationMembers,
+  paymentWebhookEvents,
+  subscriptionPlans,
+  subscriptions,
+} from "@/db/schema/learning";
 import { AppError } from "@/lib/api/response";
 import { createBillingProvider } from "@/lib/billing/factory";
 import { canManageOrganization } from "@/lib/permissions";
@@ -116,4 +122,53 @@ export async function applyStripeCheckoutCompleted(session: StripeCheckoutSessio
     .returning();
   if (!updated) throw new AppError("NOT_FOUND", "Subscription record not found", 404);
   return updated;
+}
+
+/**
+ * Deduplicates provider webhook deliveries per §13.10 (`payment_webhook_events`).
+ * Returns false when this event was already claimed, so the caller can treat the
+ * delivery as an idempotent no-op instead of re-applying side effects.
+ */
+export async function claimWebhookEvent(input: {
+  provider: string;
+  providerEventId: string;
+  eventType: string;
+  payload: Record<string, unknown>;
+}) {
+  const [claimed] = await db
+    .insert(paymentWebhookEvents)
+    .values({
+      provider: input.provider,
+      providerEventId: input.providerEventId,
+      eventType: input.eventType,
+      payload: input.payload,
+      status: "received",
+    })
+    .onConflictDoNothing({
+      target: [paymentWebhookEvents.provider, paymentWebhookEvents.providerEventId],
+    })
+    .returning({ id: paymentWebhookEvents.id });
+  return Boolean(claimed);
+}
+
+export async function markWebhookEventOutcome(
+  provider: string,
+  providerEventId: string,
+  status: "processed" | "failed" | "ignored",
+  error?: string,
+) {
+  await db
+    .update(paymentWebhookEvents)
+    .set({
+      status,
+      processedAt: new Date(),
+      lastError: error ?? null,
+      updatedAt: new Date(),
+    })
+    .where(
+      and(
+        eq(paymentWebhookEvents.provider, provider),
+        eq(paymentWebhookEvents.providerEventId, providerEventId),
+      ),
+    );
 }

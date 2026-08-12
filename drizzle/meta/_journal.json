@@ -71,6 +71,27 @@
       "when": 1785758400000,
       "tag": "0009_ai_tutor_session_indexes",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1786000000000,
+      "tag": "0010_age_band_and_webhook_dedup",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1786000100000,
+      "tag": "0011_workspace_foundation",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1786000200000,
+      "tag": "0012_rls_workspace_hardening",
+      "breakpoints": true
     }
   ]
 }

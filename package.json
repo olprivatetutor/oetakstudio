@@ -24,7 +24,8 @@
     "docker:logs": "docker compose logs -f",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test tests/**/*.test.ts",
-    "db:seed": "tsx scripts/seed.ts"
+    "db:seed": "tsx scripts/seed.ts",
+    "db:setup-runtime-role": "tsx scripts/db/create-runtime-role.ts"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",
