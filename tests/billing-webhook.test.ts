@@ -226,3 +226,123 @@ suite("stripe checkout payment-state validation", async (t) => {
     );
   });
 });
+
+/**
+ * NEW-6: delayed payment methods complete the Checkout session as `unpaid` and
+ * settle later via `checkout.session.async_payment_succeeded`. Before this fix
+ * only `checkout.session.completed` was handled, so those subscriptions never
+ * activated at all. These drive the real subscription row so activation is
+ * observed rather than inferred.
+ */
+suite("stripe delayed payment settlement", async (t) => {
+  process.env.DATABASE_URL = dbUrl!;
+  const { applyStripeCheckoutCompleted, claimWebhookEvent, markWebhookEventOutcome } = await import(
+    "@/features/billing/service"
+  );
+
+  const client = new Client({ connectionString: dbUrl! });
+  await client.connect();
+  const subjectId = `u-async-${randomUUID()}`;
+  const eventIds: string[] = [];
+
+  t.after(async () => {
+    await client.query(`DELETE FROM "subscriptions" WHERE "subject_id" = $1`, [subjectId]);
+    if (eventIds.length > 0) {
+      await client.query(
+        `DELETE FROM "payment_webhook_events" WHERE "provider_event_id" = ANY($1)`,
+        [eventIds],
+      );
+    }
+    await client.end();
+  });
+
+  await client.query(
+    `INSERT INTO "subscriptions" ("id","subject_type","subject_id","plan","status","seats","billing_interval","created_at","updated_at")
+     VALUES ($1,'individual',$2,'free','trialing',1,'monthly',now(),now())`,
+    [`sub-async-${randomUUID()}`, subjectId],
+  );
+
+  const session = {
+    id: "cs_async_1",
+    customer: "cus_async_1",
+    subscription: "sub_async_1",
+    metadata: {
+      subjectType: "individual",
+      subjectId,
+      plan: "personal",
+      interval: "annual",
+    },
+  };
+
+  async function currentPlan() {
+    const { rows } = await client.query(
+      `SELECT "plan","status","billing_interval" FROM "subscriptions" WHERE "subject_id" = $1`,
+      [subjectId],
+    );
+    return rows[0] as { plan: string; status: string; billing_interval: string };
+  }
+
+  await t.test("an unpaid completed session does not activate", async () => {
+    const outcome = await applyStripeCheckoutCompleted({ ...session, payment_status: "unpaid" });
+    assert.equal(outcome.applied, false);
+    const plan = await currentPlan();
+    assert.equal(plan.plan, "free", "plan must remain free while payment is unsettled");
+    assert.equal(plan.status, "trialing");
+  });
+
+  await t.test("the later async_payment_succeeded settlement activates", async () => {
+    // Same session, now paid — this is what Stripe delivers when funds clear.
+    const outcome = await applyStripeCheckoutCompleted({ ...session, payment_status: "paid" });
+    assert.equal(outcome.applied, true);
+    const plan = await currentPlan();
+    assert.equal(plan.plan, "personal");
+    assert.equal(plan.status, "active");
+    assert.equal(plan.billing_interval, "annual", "the validated interval must be honoured");
+  });
+
+  await t.test("a duplicate async success produces no second side effect", async () => {
+    // Dedup is per provider_event_id: the settlement event is claimed once, and
+    // a redelivery of that same event id is a terminal duplicate.
+    const settlement = {
+      provider: "stripe",
+      providerEventId: `evt_async_${randomUUID()}`,
+      eventType: "checkout.session.async_payment_succeeded",
+      payload: {} as Record<string, unknown>,
+    };
+    eventIds.push(settlement.providerEventId);
+
+    assert.equal((await claimWebhookEvent(settlement)).claimed, true);
+    await markWebhookEventOutcome("stripe", settlement.providerEventId, "processed");
+
+    const redelivery = await claimWebhookEvent(settlement);
+    assert.equal(redelivery.claimed, false, "a processed settlement must not re-apply");
+
+    // Re-applying the handler directly is idempotent too: same values, no drift.
+    await applyStripeCheckoutCompleted({ ...session, payment_status: "paid" });
+    const plan = await currentPlan();
+    assert.equal(plan.plan, "personal");
+    assert.equal(plan.status, "active");
+    assert.equal(plan.billing_interval, "annual");
+  });
+
+  await t.test("an async payment failure leaves the plan un-activated", async () => {
+    const failedSubject = `u-fail-${randomUUID()}`;
+    await client.query(
+      `INSERT INTO "subscriptions" ("id","subject_type","subject_id","plan","status","seats","billing_interval","created_at","updated_at")
+       VALUES ($1,'individual',$2,'free','trialing',1,'monthly',now(),now())`,
+      [`sub-fail-${randomUUID()}`, failedSubject],
+    );
+    const outcome = await applyStripeCheckoutCompleted({
+      id: "cs_async_fail",
+      payment_status: "unpaid",
+      metadata: { ...session.metadata, subjectId: failedSubject },
+    });
+    assert.equal(outcome.applied, false);
+    const { rows } = await client.query(
+      `SELECT "plan" FROM "subscriptions" WHERE "subject_id" = $1`,
+      [failedSubject],
+    );
+    assert.equal(rows[0].plan, "free");
+    await client.query(`DELETE FROM "subscriptions" WHERE "subject_id" = $1`, [failedSubject]);
+  });
+});

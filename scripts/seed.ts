@@ -259,7 +259,12 @@ async function seedOrganizationWorkspace(input: {
       id: input.workspaceId,
       type: "ORGANIZATION",
       name: input.name,
+      // Seeded workspaces keep their historical `org-<slug>` slugs so existing
+      // fixtures stay stable. Runtime creation no longer derives slugs from
+      // user-supplied text at all — app_bootstrap_workspace generates them
+      // (migration 0014) — so this naming cannot be squatted through the API.
       slug: `org-${input.organizationSlug}`,
+      createdById: input.ownerUserId,
       createdAt: now,
       updatedAt: now,
     })

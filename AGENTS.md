@@ -569,8 +569,30 @@ For async operations, provide explicit states for:
 Responsive/mobile-first web is MVP. Native mobile is not.
 
 ---
+## 18. UI/UX and Visual Identity
 
-## 18. Testing Requirements
+All UI/UX implementation must follow the canonical visual identity defined in
+`app_summary.md` and `docs/ui-ux-design-system.md`.
+
+Non-negotiable rules:
+
+- Primary brand color: `#274029`
+- Secondary brand color: `#624F8C`
+- Do not introduce arbitrary primary brand palettes.
+- Human illustration characters must follow the canonical Muslim modesty
+  guidelines.
+- Human characters must be faceless.
+- Male characters must use modest clothing with non-isbal trousers.
+- Female characters must use loose modest clothing and a long hijab covering
+  the hair, neck, and chest.
+- These rules also apply to prompts used for AI-generated visual assets.
+
+Before creating or modifying UI, inspect and reuse existing design tokens,
+components, and patterns.
+
+---
+
+## 19. Testing Requirements
 
 Every implementation must add or update tests appropriate to the change.
 
@@ -614,7 +636,7 @@ Use the scripts defined by the repository; do not invent command names when `pac
 
 ---
 
-## 19. MVP End-to-End Definition of Done
+## 20. MVP End-to-End Definition of Done
 
 When work affects the MVP vertical slice, protect the complete flow in `app_summary.md` §20.4:
 
@@ -648,7 +670,7 @@ A UI mock without these underlying invariants is not completion of the MVP featu
 
 ---
 
-## 20. Change Strategy
+## 21. Change Strategy
 
 For each task:
 
@@ -666,7 +688,7 @@ Avoid broad rewrites while implementing one vertical feature.
 
 ---
 
-## 21. Completion Report for Coding Agents
+## 22. Completion Report for Coding Agents
 
 At the end of a coding task, summarize:
 
@@ -681,7 +703,7 @@ Do not claim tests passed if they were not run.
 
 ---
 
-## 22. Hard Prohibitions
+## 23. Hard Prohibitions
 
 Do **not**:
 
@@ -709,7 +731,7 @@ Do **not**:
 
 ---
 
-## 23. Default Interpretation Rule
+## 24. Default Interpretation Rule
 
 When `app_summary.md` is precise, implement it as written.
 

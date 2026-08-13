@@ -328,51 +328,269 @@ suite("workspace RLS isolation", async (t) => {
     assert.equal(after[0].name, "B", "victim workspace state must be untouched");
   });
 
-  await t.test("bootstrap: a caller may claim only a workspace with no members", async () => {
-    // The legitimate case the removed unpinned branch existed to serve. It must
-    // still work, or registration/organization creation breaks — but only for a
-    // workspace that has no memberships at all, and only for the caller
-    // themselves, which is what lib/services/workspace.ts does.
-    const freshWs = `w-boot-${randomUUID()}`;
-    const freshMem = `m-boot-${randomUUID()}`;
-
-    await asRuntime(url, { userId: ids.userA, workspaceId: null }, async (c) => {
-      await c.query(
-        `INSERT INTO "workspaces" ("id","type","name","slug") VALUES ($1,'ORGANIZATION','Boot',$2)`,
-        [freshWs, `slug-${freshWs}`],
-      );
-      // provisionWorkspace pins the new workspace here, before the membership.
-      await c.query("select set_config('app.current_workspace_id', $1, true)", [freshWs]);
-      await c.query(
-        `INSERT INTO "workspace_memberships" ("id","workspace_id","user_id","status") VALUES ($1,$2,$3,'ACTIVE')`,
-        [freshMem, freshWs, ids.userA],
-      );
-      const ownerRoleId = (await c.query(`SELECT "id" FROM "roles" WHERE "code" = 'ORG_OWNER'`))
-        .rows[0].id as string;
-      await c.query(`INSERT INTO "membership_roles" ("membership_id","role_id") VALUES ($1,$2)`, [
-        freshMem,
-        ownerRoleId,
-      ]);
-    });
-
-    const { rows } = await owner.query(
-      `SELECT count(*)::int AS n FROM "workspace_memberships" WHERE "id" = $1`,
-      [freshMem],
-    );
-    assert.equal(rows[0].n, 1, "bootstrap of a newly created workspace must still succeed");
-
-    // Once claimed, the same shape must no longer work for anyone else.
-    await expectRlsViolation(
-      asRuntime(url, { userId: ids.userB, workspaceId: freshWs }, (c) =>
+  await t.test("NEW-2: runtime code cannot insert a workspace directly", async () => {
+    // 0014 removes both the policy and the privilege. This is what makes slug
+    // squatting structurally impossible rather than merely rate-limited: there
+    // is no route to a workspace row except app_bootstrap_workspace, which
+    // generates the slug itself.
+    await assert.rejects(
+      asRuntime(url, { userId: ids.userA, workspaceId: null }, (c) =>
         c.query(
-          `INSERT INTO "workspace_memberships" ("id","workspace_id","user_id","status") VALUES ($1,$2,$3,'ACTIVE')`,
-          [`m-x-${randomUUID()}`, freshWs, ids.userB],
+          `INSERT INTO "workspaces" ("id","type","name","slug") VALUES ($1,'ORGANIZATION','squat','org-acme-corp')`,
+          [`w-squat-${randomUUID()}`],
         ),
       ),
-      "self-joining a workspace that already has members",
+      /permission denied/i,
+      "the runtime role must not be able to create workspaces directly",
+    );
+  });
+
+  await t.test("bootstrap creates workspace, membership and ORG_OWNER atomically", async () => {
+    const workspaceId = await asRuntime(url, { userId: ids.userA, workspaceId: null }, async (c) =>
+      (
+        await c.query(
+          `SELECT app_bootstrap_workspace('ORGANIZATION','Boot',string_to_array('ORG_OWNER',','),3) AS id`,
+        )
+      ).rows[0].id as string,
     );
 
-    await owner.query(`DELETE FROM "workspaces" WHERE "id" = $1`, [freshWs]);
+    const { rows } = await owner.query(
+      `SELECT w."created_by_id", w."slug", wm."user_id", wm."status", r."code"
+         FROM "workspaces" w
+         JOIN "workspace_memberships" wm ON wm."workspace_id" = w."id"
+         JOIN "membership_roles" mr ON mr."membership_id" = wm."id"
+         JOIN "roles" r ON r."id" = mr."role_id"
+        WHERE w."id" = $1`,
+      [workspaceId],
+    );
+    assert.equal(rows.length, 1, "bootstrap must create exactly one owner membership");
+    assert.equal(rows[0].created_by_id, ids.userA, "creator lineage must be recorded");
+    assert.equal(rows[0].user_id, ids.userA);
+    assert.equal(rows[0].status, "ACTIVE");
+    assert.equal(rows[0].code, "ORG_OWNER");
+    assert.match(rows[0].slug, /^ws-[0-9a-f]{32}$/, "slug must be server-generated, not derived");
+
+    await owner.query(`DELETE FROM "workspaces" WHERE "id" = $1`, [workspaceId]);
+  });
+
+  await t.test("bootstrap cannot be aimed at another user or a platform role", async () => {
+    // The creator comes from app.current_user_id, never a parameter, so there is
+    // no way to bootstrap on someone else's behalf.
+    const workspaceId = await asRuntime(url, { userId: ids.userA, workspaceId: null }, async (c) =>
+      (
+        await c.query(
+          `SELECT app_bootstrap_workspace('ORGANIZATION','Escalate',string_to_array('SUPER_ADMIN,ORG_OWNER',','),3) AS id`,
+        )
+      ).rows[0].id as string,
+    );
+
+    const { rows } = await owner.query(
+      `SELECT r."code" FROM "workspace_memberships" wm
+         JOIN "membership_roles" mr ON mr."membership_id" = wm."id"
+         JOIN "roles" r ON r."id" = mr."role_id"
+        WHERE wm."workspace_id" = $1`,
+      [workspaceId],
+    );
+    const granted = rows.map((r) => r.code).sort();
+    assert.deepEqual(granted, ["ORG_OWNER"], "a PLATFORM-scope role must never be granted");
+
+    const { rows: members } = await owner.query(
+      `SELECT "user_id" FROM "workspace_memberships" WHERE "workspace_id" = $1`,
+      [workspaceId],
+    );
+    assert.deepEqual(members.map((m) => m.user_id), [ids.userA]);
+
+    await owner.query(`DELETE FROM "workspaces" WHERE "id" = $1`, [workspaceId]);
+  });
+
+  await t.test("NEW-1 regression: an orphaned workspace cannot be taken over", async () => {
+    // Both orphaning paths from the second security review. In each case the
+    // workspace still exists and still holds tenant data, but has zero
+    // memberships — the condition 0013's app_workspace_is_unclaimed treated as
+    // "claim me".
+    const ownerRoleId = (await owner.query(`SELECT "id" FROM "roles" WHERE "code" = 'ORG_OWNER'`))
+      .rows[0].id as string;
+
+    async function assertNotTakeoverable(workspaceId: string, label: string) {
+      const remaining = await owner.query(
+        `SELECT count(*)::int AS n FROM "workspace_memberships" WHERE "workspace_id" = $1`,
+        [workspaceId],
+      );
+      assert.equal(remaining.rows[0].n, 0, `${label}: precondition — workspace must be orphaned`);
+
+      // 1. cannot join
+      await expectRlsViolation(
+        asRuntime(url, { userId: ids.userA, workspaceId }, (c) =>
+          c.query(
+            `INSERT INTO "workspace_memberships" ("id","workspace_id","user_id","status") VALUES ($1,$2,$3,'ACTIVE')`,
+            [`m-take-${randomUUID()}`, workspaceId, ids.userA],
+          ),
+        ),
+        `${label}: joining an orphaned workspace`,
+      );
+      // ...including from an unpinned context.
+      await expectRlsViolation(
+        asRuntime(url, { userId: ids.userA, workspaceId: null }, (c) =>
+          c.query(
+            `INSERT INTO "workspace_memberships" ("id","workspace_id","user_id","status") VALUES ($1,$2,$3,'ACTIVE')`,
+            [`m-take2-${randomUUID()}`, workspaceId, ids.userA],
+          ),
+        ),
+        `${label}: joining an orphaned workspace unpinned`,
+      );
+
+      // 2. cannot grant themselves a role (no membership row exists to hang one on,
+      //    but assert the policy refuses even a fabricated membership id).
+      await expectRlsViolation(
+        asRuntime(url, { userId: ids.userA, workspaceId }, (c) =>
+          c.query(`INSERT INTO "membership_roles" ("membership_id","role_id") VALUES ($1,$2)`, [
+            `m-take-${randomUUID()}`,
+            ownerRoleId,
+          ]),
+        ),
+        `${label}: granting a role in an orphaned workspace`,
+      );
+
+      // 3. cannot mutate the workspace
+      const mutated = await asRuntime(url, { userId: ids.userA, workspaceId }, async (c) =>
+        (await c.query(`UPDATE "workspaces" SET "name" = 'pwned' WHERE "id" = $1`, [workspaceId]))
+          .rowCount,
+      );
+      assert.equal(mutated, 0, `${label}: orphaned workspace must not be mutable`);
+
+      // 4. and it stays invisible
+      const visible = await asRuntime(url, { userId: ids.userA, workspaceId }, async (c) =>
+        (await c.query(`SELECT "id" FROM "workspaces"`)).rowCount,
+      );
+      assert.equal(visible, 0, `${label}: orphaned workspace must not be readable`);
+    }
+
+    // Path 1: the last member deletes their own membership.
+    const leaver = `u-leave-${randomUUID()}`;
+    await owner.query(
+      `INSERT INTO "user" ("id","name","email","email_verified","age_band","created_at","updated_at")
+       VALUES ($1,'Leaver',$2,true,'ADULT',now(),now())`,
+      [leaver, `${leaver}@example.test`],
+    );
+    const wsLeft = await asRuntime(url, { userId: leaver, workspaceId: null }, async (c) =>
+      (
+        await c.query(
+          `SELECT app_bootstrap_workspace('ORGANIZATION','Left',string_to_array('ORG_OWNER',','),3) AS id`,
+        )
+      ).rows[0].id as string,
+    );
+    const leftMembership = (
+      await owner.query(`SELECT "id" FROM "workspace_memberships" WHERE "workspace_id" = $1`, [
+        wsLeft,
+      ])
+    ).rows[0].id as string;
+    const removed = await asRuntime(url, { userId: leaver, workspaceId: wsLeft }, async (c) =>
+      (await c.query(`DELETE FROM "workspace_memberships" WHERE "id" = $1`, [leftMembership]))
+        .rowCount,
+    );
+    assert.equal(removed, 1, "the last member can still leave — that is not what we are fixing");
+    await assertNotTakeoverable(wsLeft, "last member left");
+
+    // Path 2: the last member's user account is deleted and the membership cascades.
+    const doomed = `u-doomed-${randomUUID()}`;
+    await owner.query(
+      `INSERT INTO "user" ("id","name","email","email_verified","age_band","created_at","updated_at")
+       VALUES ($1,'Doomed',$2,true,'ADULT',now(),now())`,
+      [doomed, `${doomed}@example.test`],
+    );
+    const wsCascade = await asRuntime(url, { userId: doomed, workspaceId: null }, async (c) =>
+      (
+        await c.query(
+          `SELECT app_bootstrap_workspace('ORGANIZATION','Cascade',string_to_array('ORG_OWNER',','),3) AS id`,
+        )
+      ).rows[0].id as string,
+    );
+    await owner.query(`DELETE FROM "user" WHERE "id" = $1`, [doomed]);
+    await assertNotTakeoverable(wsCascade, "owner account deleted");
+
+    // The original creator does not automatically regain access either: there is
+    // no recovery flow yet, and emptiness must never be an implicit grant.
+    await expectRlsViolation(
+      asRuntime(url, { userId: leaver, workspaceId: wsLeft }, (c) =>
+        c.query(
+          `INSERT INTO "workspace_memberships" ("id","workspace_id","user_id","status") VALUES ($1,$2,$3,'ACTIVE')`,
+          [`m-recover-${randomUUID()}`, wsLeft, leaver],
+        ),
+      ),
+      "the original creator re-joining an emptied workspace",
+    );
+
+    await owner.query(`DELETE FROM "workspaces" WHERE "id" = ANY($1)`, [[wsLeft, wsCascade]]);
+    await owner.query(`DELETE FROM "user" WHERE "id" = $1`, [leaver]);
+  });
+
+  await t.test("§4.9 gates: verification, age band, and creation limit", async () => {
+    async function bootstrapAs(userId: string, limit = 3) {
+      return asRuntime(url, { userId, workspaceId: null }, async (c) =>
+        (
+          await c.query(
+            `SELECT app_bootstrap_workspace('ORGANIZATION','Gated',string_to_array('ORG_OWNER',','),$1) AS id`,
+            [limit],
+          )
+        ).rows[0].id as string,
+      );
+    }
+
+    // Unverified email cannot create an organization workspace.
+    const unverified = `u-unver-${randomUUID()}`;
+    await owner.query(
+      `INSERT INTO "user" ("id","name","email","email_verified","age_band","created_at","updated_at")
+       VALUES ($1,'Unverified',$2,false,'ADULT',now(),now())`,
+      [unverified, `${unverified}@example.test`],
+    );
+    await assert.rejects(bootstrapAs(unverified), /email is not verified/i);
+
+    // UNDER_13 cannot, even when verified.
+    const child = `u-child-${randomUUID()}`;
+    await owner.query(
+      `INSERT INTO "user" ("id","name","email","email_verified","age_band","created_at","updated_at")
+       VALUES ($1,'Child',$2,true,'UNDER_13',now(),now())`,
+      [child, `${child}@example.test`],
+    );
+    await assert.rejects(bootstrapAs(child), /under 13/i);
+
+    // A PERSONAL workspace is still allowed for a minor — §4.9 restricts
+    // organization creation only.
+    const personal = await asRuntime(url, { userId: child, workspaceId: null }, async (c) =>
+      (
+        await c.query(
+          `SELECT app_bootstrap_workspace('PERSONAL','My Space',string_to_array('LEARNER',','),3) AS id`,
+        )
+      ).rows[0].id as string,
+    );
+    assert.ok(personal, "a minor must still get a personal workspace");
+
+    // Creation limit is enforced inside the function, so it cannot be raced.
+    const prolific = `u-many-${randomUUID()}`;
+    await owner.query(
+      `INSERT INTO "user" ("id","name","email","email_verified","age_band","created_at","updated_at")
+       VALUES ($1,'Prolific',$2,true,'ADULT',now(),now())`,
+      [prolific, `${prolific}@example.test`],
+    );
+    const madeIds: string[] = [];
+    for (let i = 0; i < 2; i++) madeIds.push(await bootstrapAs(prolific, 2));
+    await assert.rejects(bootstrapAs(prolific, 2), /WORKSPACE_LIMIT_EXCEEDED/);
+
+    await owner.query(`DELETE FROM "workspaces" WHERE "id" = ANY($1)`, [[...madeIds, personal]]);
+    await owner.query(`DELETE FROM "user" WHERE "id" = ANY($1)`, [
+      [unverified, child, prolific],
+    ]);
+  });
+
+  await t.test("an unauthenticated context cannot bootstrap at all", async () => {
+    await assert.rejects(
+      asRuntime(url, {}, (c) =>
+        c.query(
+          `SELECT app_bootstrap_workspace('ORGANIZATION','NoAuth',string_to_array('ORG_OWNER',','),3)`,
+        ),
+      ),
+      /no authenticated user context/i,
+    );
   });
 
   await t.test("P1-4: user PII is not readable across workspaces", async () => {

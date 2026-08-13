@@ -40,8 +40,14 @@ async function probe(env: Record<string, string | undefined>, script: string) {
       "-e",
       // `tsx -e` evaluates as CJS, so a dynamic import of a TS module arrives
       // interop-wrapped: the real namespace is under `.default`.
+      //
+      // The exit is explicit: a successful probe leaves an idle node-postgres
+      // pool holding the event loop open, which would otherwise hang until the
+      // execFile timeout. `write`'s callback fires after the pipe is flushed, so
+      // the result is never truncated by the exit.
       `import('./db/runtime.ts').then(async (ns) => { const m = ns.default ?? ns; ${script} })` +
-        `.then(() => console.log('OK')).catch((e) => console.log('THREW:' + e.message))`,
+        `.then(() => 'OK').catch((e) => 'THREW:' + e.message)` +
+        `.then((out) => process.stdout.write(out + '\\n', () => process.exit(0)))`,
     ],
     {
       cwd: process.cwd(),
@@ -52,12 +58,23 @@ async function probe(env: Record<string, string | undefined>, script: string) {
   return stdout.trim().split("\n").at(-1) ?? "";
 }
 
-test("production refuses to fall back to the owner connection", async () => {
+test("NEW-3: importing the module in production does not throw", async () => {
+  // `next build` runs with NODE_ENV=production. Throwing at module load would
+  // break the build on any machine whose build-time environment differs from its
+  // runtime environment, so the guard must not fire on import alone.
   const result = await probe(
     { NODE_ENV: "production", RUNTIME_DATABASE_URL: "" },
     "return m.runtimeDb;",
   );
-  assert.match(result, /^THREW:/, "module load must fail closed in production");
+  assert.equal(result, "OK", "module import must be side-effect free in production");
+});
+
+test("production still fails closed before any protected query runs", async () => {
+  const result = await probe(
+    { NODE_ENV: "production", RUNTIME_DATABASE_URL: "" },
+    "return m.withUserContext('u-probe', async () => 1);",
+  );
+  assert.match(result, /^THREW:/, "the first protected query must fail closed");
   assert.match(result, /RUNTIME_DATABASE_URL is required in production/);
 });
 
@@ -96,4 +113,27 @@ dbSuite("the app_rw runtime connection is accepted", async () => {
     "return m.withUserContext('u-probe', async () => 1);",
   );
   assert.equal(result, "OK", "a correctly restricted runtime role must be accepted");
+});
+
+dbSuite("NEW-4: a failed privilege assertion is retried, not cached forever", async () => {
+  // First call fails the production guard; the configuration is then corrected
+  // in-process and the second call must succeed. A memoised rejection would make
+  // the second call fail identically and require a restart to recover.
+  //
+  // DATABASE_URL is pointed at app_rw so the connection built at module load is
+  // already the correct one — only the missing env var is at fault.
+  const appRw = runtimeUrl(ownerUrl!);
+  const result = await probe(
+    { NODE_ENV: "production", RUNTIME_DATABASE_URL: "", DATABASE_URL: appRw },
+    `
+    let first = 'none';
+    try { await m.withUserContext('u-probe', async () => 1); }
+    catch (e) { first = e.message.slice(0, 40); }
+    if (!first.includes('RUNTIME_DATABASE_URL')) throw new Error('expected first call to fail, got: ' + first);
+    process.env.RUNTIME_DATABASE_URL = ${JSON.stringify(appRw)};
+    await m.withUserContext('u-probe', async () => 1);
+    return 1;
+    `,
+  );
+  assert.equal(result, "OK", "the assertion must be retryable after the config is fixed");
 });

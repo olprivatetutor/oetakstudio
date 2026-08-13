@@ -53,12 +53,16 @@ export const workspaces = pgTable(
     slug: text("slug").notNull(),
     status: workspaceStatusEnum("status").default("ACTIVE").notNull(),
     settings: jsonb("settings").$type<Record<string, unknown>>().default({}).notNull(),
+    // §4.9/ADR-020 lineage and creation rate limit. Audit/attribution only —
+    // never used as an authorization predicate, so a stale value grants nothing.
+    createdById: text("created_by_id").references(() => user.id, { onDelete: "set null" }),
     ...timestampColumns,
   },
   (table) => [
     uniqueIndex("workspaces_slug_unique").on(table.slug),
     index("workspaces_type_idx").on(table.type),
     index("workspaces_status_idx").on(table.status),
+    index("workspaces_created_by_idx").on(table.createdById),
   ],
 );
 

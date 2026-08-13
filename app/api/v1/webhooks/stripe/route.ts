@@ -13,6 +13,17 @@ type StripeEvent = {
   data?: { object?: Parameters<typeof applyStripeCheckoutCompleted>[0] };
 };
 
+/**
+ * Checkout events that may activate a subscription. `async_payment_succeeded` is
+ * the settlement event for delayed payment methods, where the original
+ * `completed` event arrived unpaid and was correctly ignored — without it those
+ * subscriptions would never activate (§13.10).
+ */
+const ACTIVATING_EVENT_TYPES = new Set([
+  "checkout.session.completed",
+  "checkout.session.async_payment_succeeded",
+]);
+
 export async function POST(request: NextRequest) {
   try {
     const signature = request.headers.get("stripe-signature");
@@ -38,15 +49,27 @@ export async function POST(request: NextRequest) {
     }
 
     try {
-      if (event.type === "checkout.session.completed" && event.data?.object) {
+      if (ACTIVATING_EVENT_TYPES.has(event.type) && event.data?.object) {
+        // `checkout.session.completed` activates only when the payment already
+        // settled; for a delayed payment method it arrives `unpaid` and is
+        // ignored, and `checkout.session.async_payment_succeeded` carries the
+        // same session once funds clear. Both route through one handler, whose
+        // update is idempotent, so a redelivery of either cannot double-apply.
         const outcome = await applyStripeCheckoutCompleted(event.data.object);
-        // An unsettled payment is not a failure to retry: Stripe will send a
-        // separate async_payment_succeeded event once funds clear.
         await markWebhookEventOutcome(
           "stripe",
           event.id,
           outcome.applied ? "processed" : "ignored",
           outcome.reason,
+        );
+      } else if (event.type === "checkout.session.async_payment_failed") {
+        // Terminal for this session: the plan stays un-activated. Recorded
+        // rather than silently dropped so the failure is auditable.
+        await markWebhookEventOutcome(
+          "stripe",
+          event.id,
+          "ignored",
+          "async payment failed; subscription not activated",
         );
       } else {
         await markWebhookEventOutcome("stripe", event.id, "ignored", `unhandled type ${event.type}`);

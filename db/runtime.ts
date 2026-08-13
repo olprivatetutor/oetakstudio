@@ -18,39 +18,54 @@ const schema = { ...authSchema, ...learningSchema, ...workspaceSchema };
  * to. Falls back to `DATABASE_URL` only for local/dev bootstrapping before
  * `RUNTIME_DATABASE_URL` is configured — production deployments must set it.
  */
+/**
+ * Resolves the connection string without ever throwing at module load.
+ *
+ * The production requirement is enforced in `assertRuntimeRoleIsRestricted`
+ * instead (NEW-3): `next build` runs with NODE_ENV=production, so throwing here
+ * would fail the build on any machine whose build-time environment differs from
+ * its runtime environment — a deployment footgun, not a security control. The
+ * check still runs before any protected query, because every context helper
+ * awaits the assertion before opening its transaction.
+ */
 function runtimeConnectionString() {
-  const runtimeUrl = process.env.RUNTIME_DATABASE_URL;
-  if (runtimeUrl) return runtimeUrl;
+  // `||`, not `??`: an env var set to the empty string is "unset" here, both in
+  // .env files and in CI. Using `??` would treat "" as a configured connection
+  // string and hand the driver an unusable one, and would also disagree with the
+  // falsy check the production guard below uses.
+  return process.env.RUNTIME_DATABASE_URL || process.env.DATABASE_URL || "";
+}
 
-  // Falling back to DATABASE_URL means connecting as the owner -- typically a
-  // superuser, which bypasses RLS unconditionally (FORCE does not apply to
-  // superusers). Silently doing that in production would turn every policy in
-  // 0012/0013 into a no-op with no signal at all, so it is refused outright.
-  if (process.env.NODE_ENV === "production") {
+export const runtimeDb = drizzle(runtimeConnectionString(), { schema });
+
+/**
+ * Verifies that the runtime connection cannot defeat RLS, before any protected
+ * query runs. Two independent checks:
+ *
+ *   1. In production, `RUNTIME_DATABASE_URL` must be set. Falling back to
+ *      `DATABASE_URL` connects as the owner — typically a superuser, which
+ *      bypasses RLS unconditionally (FORCE does not apply to superusers) — and
+ *      would silently turn every policy in 0012/0013/0014 into a no-op.
+ *   2. The role we are ACTUALLY connected as is inspected live. Asserting this
+ *      about `app_rw` by name proves nothing if the connection string points
+ *      somewhere else.
+ *
+ * The successful result is cached for the process. A failure is NOT cached
+ * (NEW-4): the cache slot is cleared on rejection so a later call can retry once
+ * the configuration or the database is fixed, rather than poisoning the process.
+ */
+let privilegeCheck: Promise<void> | null = null;
+
+async function runPrivilegeCheck(): Promise<void> {
+  if (process.env.NODE_ENV === "production" && !process.env.RUNTIME_DATABASE_URL) {
     throw new Error(
       "RUNTIME_DATABASE_URL is required in production (ADR-009 / §16.3.2). " +
         "Workspace-scoped queries must not run on the owner connection, which bypasses RLS. " +
         "Set it to the app_rw role: postgresql://app_rw:<password>@<host>:<port>/<database>",
     );
   }
-  return process.env.DATABASE_URL!;
-}
 
-export const runtimeDb = drizzle(runtimeConnectionString(), { schema });
-
-/**
- * Verifies that the role we are ACTUALLY connected as cannot defeat RLS. The
- * existing test asserts this about `app_rw` by name, which proves nothing if the
- * connection string points somewhere else — this checks the live session.
- *
- * Runs once per process, on first use, and caches the result. A rejection is not
- * cached as a success, so a transient connection failure does not permanently
- * mark the runtime as unverified.
- */
-let privilegeCheck: Promise<void> | null = null;
-
-async function assertRuntimeRoleIsRestricted() {
-  privilegeCheck ??= (async () => {
+  {
     const { rows } = (await runtimeDb.execute(sql`
       select
         current_user as role_name,
@@ -83,11 +98,21 @@ async function assertRuntimeRoleIsRestricted() {
           `${problems.join("; ")}. Point RUNTIME_DATABASE_URL at the app_rw role (ADR-009 / §16.3.2).`,
       );
     }
-  })().catch((error) => {
-    privilegeCheck = null;
-    throw error;
-  });
+  }
+}
 
+async function assertRuntimeRoleIsRestricted(): Promise<void> {
+  if (!privilegeCheck) {
+    const pending = runPrivilegeCheck();
+    privilegeCheck = pending;
+    // Assigned first, then observed: clearing the slot cannot race ahead of the
+    // assignment, so a failure never stays cached as the memoised result. The
+    // handler only resets state; the rejection still propagates to the caller
+    // through `pending`.
+    pending.catch(() => {
+      if (privilegeCheck === pending) privilegeCheck = null;
+    });
+  }
   return privilegeCheck;
 }
 

@@ -3,7 +3,7 @@ import { db } from "@/db";
 import { AppError } from "@/lib/api/response";
 import { getOrganizationMembership } from "@/lib/permissions";
 import { getAppAdmin } from "@/lib/services/app-admin";
-import { organizationWorkspaceSlug, provisionWorkspace } from "@/lib/services/workspace";
+import { provisionWorkspace } from "@/lib/services/workspace";
 import { canReadCourse } from "@/lib/authorization/course-access";
 import { gradeAssessmentAnswers } from "@/lib/assessments/grading";
 import type { AssessmentAnswer } from "@/types/domain";
@@ -116,7 +116,6 @@ export async function saveOnboarding(user: User, input: OnboardingInput) {
       const { workspace } = await provisionWorkspace(tx, {
         type: "ORGANIZATION",
         name: input.organization.name,
-        slug: organizationWorkspaceSlug(input.organization.slug),
         ownerUserId: user.id,
         roleCodes: ["ORG_OWNER"],
       });
@@ -157,6 +156,17 @@ export async function saveOnboarding(user: User, input: OnboardingInput) {
         action: "organization.created",
         entityType: "organization",
         entityId: organization.id,
+      });
+
+      // §4.9/ADR-020: organization workspace creation is an audited event in its
+      // own right, separate from the organization record it backs.
+      await tx.insert(auditLogs).values({
+        actorUserId: user.id,
+        organizationId: organization.id,
+        action: "workspace.organization.created",
+        entityType: "workspace",
+        entityId: workspace.id,
+        metadata: { workspaceType: "ORGANIZATION", organizationSlug: input.organization.slug },
       });
     }
 
@@ -466,7 +476,6 @@ export async function createOrganization(user: User, input: OrganizationCreateIn
   const { workspace } = await provisionWorkspace(tx, {
     type: "ORGANIZATION",
     name: input.name,
-    slug: organizationWorkspaceSlug(input.slug),
     ownerUserId: user.id,
     roleCodes: ["ORG_OWNER"],
   });
@@ -501,6 +510,16 @@ export async function createOrganization(user: User, input: OrganizationCreateIn
     seats: 1,
     billingEmail: user.email || null,
   }).onConflictDoNothing();
+
+  // §4.9/ADR-020: audited with actor and workspace lineage.
+  await tx.insert(auditLogs).values({
+    actorUserId: user.id,
+    organizationId: organization.id,
+    action: "workspace.organization.created",
+    entityType: "workspace",
+    entityId: workspace.id,
+    metadata: { workspaceType: "ORGANIZATION", organizationSlug: input.slug },
+  });
 
   return organization;
   });

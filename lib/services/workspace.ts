@@ -1,81 +1,197 @@
-import { createHash } from "node:crypto";
-import { inArray, sql } from "drizzle-orm";
+import { and, count, eq, sql } from "drizzle-orm";
 import { db } from "@/db";
-import { membershipRoles, roles, workspaceMemberships, workspaces } from "@/db/schema/workspace";
+import {
+  membershipRoles,
+  permissions,
+  rolePermissions,
+  workspaceMemberships,
+  workspaces,
+} from "@/db/schema/workspace";
+import { AppError } from "@/lib/api/response";
 
 /**
- * Workspace bootstrap (§4.1-§4.4, ADR-009).
+ * Workspace bootstrap (§4.1-§4.4, §4.9 / ADR-020).
  *
- * 0011_workspace_foundation.sql backfilled a Workspace for every existing user
- * and organization and made `organizations.workspace_id` NOT NULL, but no
- * application path was updated to create one — so organization creation would
- * have failed at runtime with a NOT NULL violation. This service is that path.
+ * Creation runs through the `app_bootstrap_workspace` SQL function
+ * (drizzle/0014), not through direct inserts. That function is the only writer
+ * that can create a workspace and its founding membership, it derives the
+ * creator from `app.current_user_id` rather than a parameter, and it generates
+ * the workspace id and slug itself — so it cannot be aimed at an existing or
+ * orphaned workspace, and it cannot be used to squat a slug.
  *
- * The ordering here is a security requirement, not a convenience:
- * `workspace_memberships_insert` (drizzle/0013) requires the target workspace to
- * be pinned as `app.current_workspace_id`, and admits an unclaimed workspace
- * only for a caller adding themselves. Creating the workspace, pinning it, and
- * only then writing the first membership is what closes P0-1 while keeping
- * bootstrap possible.
- *
- * Takes a transaction so callers on the owner connection (db/index.ts) and on
- * the RLS-restricted runtime connection (db/runtime.ts) share one code path.
- * Setting the GUCs is a no-op when the caller is a superuser that bypasses RLS,
- * and required as soon as it is not — so it is done unconditionally.
+ * The §4.9 gates are enforced in two places on purpose:
+ *   * here — the `workspace.organization.create` permission check, because the
+ *     role/permission union is application authorization logic and does not
+ *     belong in SQL, plus the audit record written by the calling service;
+ *   * in the function — verified email, UNDER_13, and the per-user limit,
+ *     because those are invariants that must hold even if a caller forgets.
  */
 type Transaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+/** §4.9 default: 3 organization workspaces per user, configurable. */
+export const DEFAULT_ORG_WORKSPACE_LIMIT = 3;
+
+export function organizationWorkspaceLimit() {
+  const configured = Number(process.env.ORG_WORKSPACE_LIMIT_PER_USER);
+  return Number.isInteger(configured) && configured > 0
+    ? configured
+    : DEFAULT_ORG_WORKSPACE_LIMIT;
+}
 
 export type WorkspaceBootstrapInput = {
   type: "PERSONAL" | "ORGANIZATION";
   name: string;
-  slug: string;
   ownerUserId: string;
   /** Workspace role codes granted to the founding member, e.g. ["ORG_OWNER"]. */
   roleCodes: string[];
 };
 
-export async function provisionWorkspace(tx: Transaction, input: WorkspaceBootstrapInput) {
-  await tx.execute(sql`select set_config('app.current_user_id', ${input.ownerUserId}, true)`);
-
-  const [workspace] = await tx
-    .insert(workspaces)
-    .values({ type: input.type, name: input.name, slug: input.slug })
-    .returning();
-
-  // Pin before the first membership write — see the ordering note above.
-  await tx.execute(sql`select set_config('app.current_workspace_id', ${workspace.id}, true)`);
-
-  const [membership] = await tx
-    .insert(workspaceMemberships)
-    .values({ workspaceId: workspace.id, userId: input.ownerUserId, status: "ACTIVE" })
-    .returning();
-
-  if (input.roleCodes.length > 0) {
-    const roleRows = await tx
-      .select({ id: roles.id })
-      .from(roles)
-      .where(inArray(roles.code, input.roleCodes));
-    if (roleRows.length > 0) {
-      await tx
-        .insert(membershipRoles)
-        .values(roleRows.map((role) => ({ membershipId: membership.id, roleId: role.id })))
-        .onConflictDoNothing();
-    }
-  }
-
-  return { workspace, membership };
+/**
+ * Does the user hold `workspace.organization.create` through any ACTIVE
+ * membership? §3.4/§6: effective permissions are the union over the roles of a
+ * user's active memberships — never a single role column, never a hardcoded
+ * role array.
+ */
+export async function canCreateOrganizationWorkspace(tx: Transaction, userId: string) {
+  const [row] = await tx
+    .select({ n: count() })
+    .from(workspaceMemberships)
+    .innerJoin(membershipRoles, eq(membershipRoles.membershipId, workspaceMemberships.id))
+    .innerJoin(rolePermissions, eq(rolePermissions.roleId, membershipRoles.roleId))
+    .innerJoin(permissions, eq(permissions.id, rolePermissions.permissionId))
+    .where(
+      and(
+        eq(workspaceMemberships.userId, userId),
+        eq(workspaceMemberships.status, "ACTIVE"),
+        eq(permissions.code, "workspace.organization.create"),
+      ),
+    );
+  return (row?.n ?? 0) > 0;
 }
 
 /**
- * Organization Workspace slug, matching the backfill in 0011 (`'org-' || o.slug`)
- * so pre-existing and newly created organizations share one naming rule.
- * `workspaces.slug` is globally unique.
+ * Runs `fn` with `app.current_user_id` set, restoring whatever was there before.
+ *
+ * `app_bootstrap_workspace` reads the creator from the transaction-local GUC, so
+ * it has to be set — but this transaction may be doing unrelated workspace-scoped
+ * work before and after (NEW-5). Saving and restoring both GUCs keeps the
+ * mutation from leaking. `current_setting(..., true)` yields NULL when unset,
+ * restored here as '' — the same value `withWorkspaceContext` writes for
+ * "absent", which the fail-closed accessors collapse back to NULL.
  */
-export function organizationWorkspaceSlug(organizationSlug: string) {
-  return `org-${organizationSlug}`;
+async function withPreservedContext<T>(
+  tx: Transaction,
+  userId: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const previous = (await tx.execute(sql`
+    select
+      coalesce(current_setting('app.current_user_id', true), '') as user_id,
+      coalesce(current_setting('app.current_workspace_id', true), '') as workspace_id
+  `)) as unknown as { rows: Array<{ user_id: string; workspace_id: string }> };
+  const before = previous.rows[0] ?? { user_id: "", workspace_id: "" };
+
+  const restore = async () => {
+    await tx.execute(sql`select set_config('app.current_user_id', ${before.user_id}, true)`);
+    await tx.execute(
+      sql`select set_config('app.current_workspace_id', ${before.workspace_id}, true)`,
+    );
+  };
+
+  await tx.execute(sql`select set_config('app.current_user_id', ${userId}, true)`);
+  try {
+    const result = await fn();
+    await restore();
+    return result;
+  } catch (error) {
+    // On failure the transaction is already aborted, so the restore itself would
+    // raise 25P02 and mask the real cause. It is also moot: SET LOCAL dies with
+    // the transaction. Best-effort only, and never at the expense of the error
+    // the caller needs to see.
+    await restore().catch(() => {});
+    throw error;
+  }
 }
 
-/** Personal Workspace slug, matching 0011's `'personal-' || md5(u.id)`. */
-export function personalWorkspaceSlug(userId: string) {
-  return `personal-${createHash("md5").update(userId).digest("hex")}`;
+/**
+ * Maps the function's SQLSTATEs onto stable application error codes.
+ *
+ * Drizzle wraps driver errors in its own `Failed query` Error and hangs the
+ * original on `cause`, so the SQLSTATE and the RAISE message have to be read
+ * from there — reading `error.code` off the wrapper alone silently matches
+ * nothing and every gate would surface as an opaque 500.
+ */
+function translateBootstrapError(error: unknown): never {
+  const cause = (error as { cause?: unknown }).cause;
+  const driverError = (cause ?? error) as { code?: string; message?: string };
+  const code = driverError.code;
+  const message = `${driverError.message ?? ""} ${(error as { message?: string }).message ?? ""}`;
+  if (code === "53400") {
+    throw new AppError(
+      "RATE_LIMITED",
+      `Organization workspace creation limit reached (${organizationWorkspaceLimit()} per user)`,
+      429,
+    );
+  }
+  if (code === "42501") {
+    if (message.includes("email is not verified")) {
+      throw new AppError("FORBIDDEN", "A verified email address is required", 403);
+    }
+    if (message.includes("under 13")) {
+      throw new AppError(
+        "FORBIDDEN",
+        "Accounts under 13 cannot create organization workspaces",
+        403,
+      );
+    }
+    throw new AppError("FORBIDDEN", "Workspace creation is not permitted", 403);
+  }
+  throw error;
+}
+
+export async function provisionWorkspace(tx: Transaction, input: WorkspaceBootstrapInput) {
+  if (input.type === "ORGANIZATION") {
+    // §4.9 permission gate, checked before the call so the caller gets a precise
+    // error rather than the function's generic refusal.
+    if (!(await canCreateOrganizationWorkspace(tx, input.ownerUserId))) {
+      throw new AppError(
+        "FORBIDDEN",
+        "The workspace.organization.create permission is required",
+        403,
+      );
+    }
+  }
+
+  // Role codes are passed as one bound parameter and split server-side, so no
+  // caller-supplied text is ever concatenated into SQL.
+  const roleCodeList = input.roleCodes.join(",");
+
+  const workspaceId = await withPreservedContext(tx, input.ownerUserId, async () => {
+    try {
+      const result = (await tx.execute(sql`
+        select "app_bootstrap_workspace"(
+          ${input.type},
+          ${input.name},
+          string_to_array(${roleCodeList}, ','),
+          ${organizationWorkspaceLimit()}
+        ) as workspace_id
+      `)) as unknown as { rows: Array<{ workspace_id: string }> };
+      return result.rows[0].workspace_id;
+    } catch (error) {
+      translateBootstrapError(error);
+    }
+  });
+
+  const [workspace] = await tx.select().from(workspaces).where(eq(workspaces.id, workspaceId));
+  const [membership] = await tx
+    .select()
+    .from(workspaceMemberships)
+    .where(
+      and(
+        eq(workspaceMemberships.workspaceId, workspaceId),
+        eq(workspaceMemberships.userId, input.ownerUserId),
+      ),
+    );
+
+  return { workspace, membership };
 }

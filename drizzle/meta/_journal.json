@@ -99,6 +99,13 @@
       "when": 1786000300000,
       "tag": "0013_rls_membership_authorization",
       "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1786000400000,
+      "tag": "0014_workspace_bootstrap_hardening",
+      "breakpoints": true
     }
   ]
 }
