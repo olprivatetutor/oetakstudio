@@ -20,6 +20,10 @@ import { ArrowLeft, Eye, EyeOff, Loader2, ShieldCheck, Sparkles } from "lucide-r
 const signUpSchema = z.object({
     name: z.string().min(2, "Name must be at least 2 characters"),
     email: z.string().email("Invalid email address"),
+    birthDate: z
+        .string()
+        .min(1, "Birth date is required")
+        .refine((value) => value <= new Date().toISOString().slice(0, 10), "Birth date cannot be in the future"),
     password: z
         .string()
         .min(8, "Password must be at least 8 characters")
@@ -44,6 +48,7 @@ export default function SignUpPage() {
         defaultValues: {
             name: "",
             email: "",
+            birthDate: "",
             password: "",
             confirmPassword: "",
         },
@@ -58,6 +63,7 @@ export default function SignUpPage() {
                 email: data.email,
                 password: data.password,
                 name: data.name,
+                birthDate: data.birthDate,
             });
 
             if (result.error) {
@@ -125,6 +131,28 @@ export default function SignUpPage() {
                                             <FormControl>
                                                 <Input type="email" placeholder="you@example.com" {...field} disabled={isLoading} />
                                             </FormControl>
+                                            <FormMessage />
+                                        </FormItem>
+                                    )}
+                                />
+
+                                <FormField
+                                    control={form.control}
+                                    name="birthDate"
+                                    render={({ field }) => (
+                                        <FormItem>
+                                            <FormLabel>Date of birth</FormLabel>
+                                            <FormControl>
+                                                <Input
+                                                    type="date"
+                                                    max={new Date().toISOString().slice(0, 10)}
+                                                    {...field}
+                                                    disabled={isLoading}
+                                                />
+                                            </FormControl>
+                                            <p className="text-xs text-muted-foreground">
+                                                Used privately to apply the correct learning and AI safety settings.
+                                            </p>
                                             <FormMessage />
                                         </FormItem>
                                     )}

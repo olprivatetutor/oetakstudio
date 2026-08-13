@@ -47,6 +47,11 @@ export type WorkspaceBootstrapInput = {
   roleCodes: string[];
 };
 
+export type PersonalWorkspaceUser = {
+  id: string;
+  name?: string | null;
+};
+
 /**
  * Does the user hold `workspace.organization.create` through any ACTIVE
  * membership? §3.4/§6: effective permissions are the union over the roles of a
@@ -231,4 +236,24 @@ export async function provisionWorkspace(tx: Transaction, input: WorkspaceBootst
     );
 
   return { workspace, membership };
+}
+
+/**
+ * Ensures the canonical post-verification workspace state for a normal user:
+ * exactly one PERSONAL workspace, one ACTIVE founding membership, and LEARNER.
+ *
+ * Idempotency and concurrency safety live in `app_bootstrap_workspace`
+ * (drizzle/0016). Keeping this as an internal service instead of a route avoids
+ * reintroducing the unrestricted PERSONAL-workspace claim/bootstrap API closed
+ * by drizzle/0014 (NEW-9).
+ */
+export async function ensurePersonalWorkspaceForUser(input: PersonalWorkspaceUser) {
+  return db.transaction((tx) =>
+    provisionWorkspace(tx, {
+      type: "PERSONAL",
+      name: input.name?.trim() || "Personal Workspace",
+      ownerUserId: input.id,
+      roleCodes: ["LEARNER"],
+    }),
+  );
 }

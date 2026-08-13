@@ -1,4 +1,4 @@
-import { pgTable, text, timestamp, boolean, integer, uniqueIndex, pgEnum, date } from "drizzle-orm/pg-core";
+import { pgTable, text, timestamp, boolean, integer, bigint, uniqueIndex, pgEnum, date } from "drizzle-orm/pg-core";
 
 // ADR-007 (app_summary.md §3.6): resolved from birth_date where provided, else a
 // self-declared band, else UNSPECIFIED. UNSPECIFIED fails closed as TEEN_13_17 for
@@ -75,9 +75,12 @@ export const verification = pgTable("verification", {
 });
 
 export const rateLimit = pgTable("rate_limit", {
+    // Better Auth adapters uniformly materialize an id field, including for
+    // database-backed rate-limit rows. `key` remains the logical primary key.
+    id: text("id").$defaultFn(() => crypto.randomUUID()).notNull().unique(),
     key: text("key").primaryKey(),
     count: integer("count").notNull(),
-    lastRequest: integer("last_request").notNull(),
+    lastRequest: bigint("last_request", { mode: "number" }).notNull(),
 });
 
 export const twoFactor = pgTable("two_factor", {
