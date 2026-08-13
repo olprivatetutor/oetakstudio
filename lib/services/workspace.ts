@@ -1,9 +1,10 @@
-import { and, count, eq, sql } from "drizzle-orm";
+import { and, count, eq, inArray, sql } from "drizzle-orm";
 import { db } from "@/db";
 import {
   membershipRoles,
   permissions,
   rolePermissions,
+  roles,
   workspaceMemberships,
   workspaces,
 } from "@/db/schema/workspace";
@@ -149,7 +150,43 @@ function translateBootstrapError(error: unknown): never {
   throw error;
 }
 
+/**
+ * Rejects any attempt to grant a PLATFORM-scope role through a workspace
+ * membership (AGENTS.md §6.5: platform and workspace roles are separate scopes).
+ *
+ * This is the application half of the control. The database enforces the same
+ * rule structurally via the `membership_roles_scope_check` trigger and the
+ * membership_roles RLS predicates (drizzle/0015), so neither layer is load-
+ * bearing alone. Rejecting here — rather than silently filtering — means a
+ * caller that asks for SUPER_ADMIN gets an error instead of a quietly reduced
+ * grant it might not notice.
+ */
+export async function assertWorkspaceScopedRoles(tx: Transaction, roleCodes: string[]) {
+  if (roleCodes.length === 0) return;
+  const rows = await tx
+    .select({ code: roles.code, scope: roles.scope })
+    .from(roles)
+    .where(inArray(roles.code, roleCodes));
+
+  const known = new Set(rows.map((row) => row.code));
+  const unknown = roleCodes.filter((code) => !known.has(code));
+  if (unknown.length > 0) {
+    throw new AppError("VALIDATION_ERROR", `Unknown workspace role: ${unknown.join(", ")}`, 400);
+  }
+
+  const platformRoles = rows.filter((row) => row.scope !== "WORKSPACE").map((row) => row.code);
+  if (platformRoles.length > 0) {
+    throw new AppError(
+      "FORBIDDEN",
+      `Platform-scope roles cannot be granted through a workspace membership: ${platformRoles.join(", ")}`,
+      403,
+    );
+  }
+}
+
 export async function provisionWorkspace(tx: Transaction, input: WorkspaceBootstrapInput) {
+  await assertWorkspaceScopedRoles(tx, input.roleCodes);
+
   if (input.type === "ORGANIZATION") {
     // §4.9 permission gate, checked before the call so the caller gets a precise
     // error rather than the function's generic refusal.

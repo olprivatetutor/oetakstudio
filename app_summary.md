@@ -2625,6 +2625,44 @@ Scope: UI, learning content, AI response language, notifications, reports, certi
 
 ---
 
+## 19.4 Visual Identity and Illustration Guidelines
+
+Oetak Studio's canonical brand colors are:
+
+- Primary: `#274029` — Deep Islamic Green
+- Secondary: `#624F8C` — Royal Purple
+
+The application must use semantic design tokens derived from these
+canonical colors rather than arbitrary page-level brand palettes.
+
+Detailed UI/UX implementation guidance is defined in
+`docs/ui-ux-design-system.md`.
+
+When Oetak Studio creates, commissions, or AI-generates human
+illustrations:
+
+- human characters use a respectful faceless Muslim illustration style;
+- detailed facial features such as eyes, nose, and mouth are not rendered;
+- clothing is modest and non-revealing;
+- male characters wear modest clothing with trousers above the ankles
+  (non-isbal);
+- female characters wear loose modest clothing and a long hijab covering
+  the hair, neck, and chest;
+- tight-fitting clothing, sexualized styling, exposed female hair/neck,
+  short hijab, and male trousers below the ankles are avoided.
+
+These requirements also apply to prompts created for AI-generated visual
+assets.
+
+These illustration requirements govern Oetak Studio-created visual
+assets and do not redefine the policy for user-uploaded personal profile
+photographs unless a separate product policy explicitly says so.
+
+Accessibility takes precedence over decorative brand usage. Color usage
+must continue to satisfy the WCAG 2.2 AA requirements in §19.1.
+
+---
+
 # 20. MVP Scope
 
 ## 20.1 MVP Objective

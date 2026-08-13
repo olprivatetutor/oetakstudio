@@ -64,6 +64,23 @@ export const invitationStatusEnum = pgEnum("invitation_status", [
   "revoked",
 ]);
 
+// ADR-007 / §3.6 / §13: minor-safety consent model.
+export const consentTypeEnum = pgEnum("consent_type", [
+  "AI_FEATURES",
+  "DATA_PROCESSING",
+  "COMMUNICATIONS",
+]);
+
+export const consentBasisEnum = pgEnum("consent_basis", ["GUARDIAN", "INSTITUTIONAL", "SELF"]);
+
+export const consentModeEnum = pgEnum("consent_mode", ["GUARDIAN", "INSTITUTIONAL"]);
+
+export const guardianLinkStatusEnum = pgEnum("guardian_link_status", [
+  "PENDING",
+  "ACTIVE",
+  "REVOKED",
+]);
+
 export const appAdminRoleEnum = pgEnum("app_admin_role", ["owner", "admin", "content"]);
 
 export const subscriptionSubjectEnum = pgEnum("subscription_subject", [
@@ -398,6 +415,13 @@ export const organizations = pgTable(
     ownerId: text("owner_id")
       .notNull()
       .references(() => user.id, { onDelete: "restrict" }),
+    // §3.6 rule 3: an organization may assert consent for its enrolled minors,
+    // recorded with actor, timestamp, and asserted legal basis.
+    consentMode: consentModeEnum("consent_mode").default("GUARDIAN").notNull(),
+    consentAssertedById: text("consent_asserted_by_id").references(() => user.id, {
+      onDelete: "set null",
+    }),
+    consentAssertedAt: timestamp("consent_asserted_at"),
     ...timestampColumns,
   },
   (table) => [
@@ -474,6 +498,11 @@ export const guardianLearners = pgTable(
     createdById: text("created_by_id")
       .notNull()
       .references(() => user.id, { onDelete: "restrict" }),
+    // §18: a PENDING relationship grants no learner visibility. New rows default
+    // to PENDING; only an explicit acceptance makes the link ACTIVE.
+    status: guardianLinkStatusEnum("status").default("PENDING").notNull(),
+    acceptedAt: timestamp("accepted_at"),
+    revokedAt: timestamp("revoked_at"),
     ...timestampColumns,
   },
   (table) => [
@@ -483,6 +512,37 @@ export const guardianLearners = pgTable(
     }),
     index("guardian_learners_guardian_idx").on(table.guardianUserId),
     index("guardian_learners_learner_idx").on(table.learnerUserId),
+    index("guardian_learners_status_idx").on(table.status),
+  ],
+);
+
+// §13 `consent_records`: explicit, auditable, revocable consent. Row existence in
+// guardian_learners must never be treated as consent (ADR-007).
+export const consentRecords = pgTable(
+  "consent_records",
+  {
+    id: idColumn().primaryKey(),
+    /** NULL when the consent is not scoped to a single workspace. */
+    workspaceId: text("workspace_id").references(() => workspaces.id, { onDelete: "cascade" }),
+    subjectUserId: text("subject_user_id")
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }),
+    consentType: consentTypeEnum("consent_type").notNull(),
+    basis: consentBasisEnum("basis").notNull(),
+    grantedById: text("granted_by_id")
+      .notNull()
+      .references(() => user.id, { onDelete: "restrict" }),
+    grantedAt: timestamp("granted_at")
+      .$defaultFn(() => new Date())
+      .notNull(),
+    revokedAt: timestamp("revoked_at"),
+    revokedById: text("revoked_by_id").references(() => user.id, { onDelete: "set null" }),
+    evidence: jsonb("evidence").$type<Record<string, unknown>>().default({}).notNull(),
+    ...timestampColumns,
+  },
+  (table) => [
+    index("consent_records_subject_idx").on(table.subjectUserId, table.consentType),
+    index("consent_records_workspace_idx").on(table.workspaceId),
   ],
 );
 
@@ -809,6 +869,10 @@ export const aiUsageRecords = pgTable(
     responseTimeMs: integer("response_time_ms"),
     success: boolean("success").default(true).notNull(),
     errorCode: text("error_code"),
+    // §12.4/§12.11: the applied safety profile and moderation outcome are
+    // recorded so any past AI response can be explained after the fact.
+    safetyProfile: text("safety_profile"),
+    moderationOutcome: text("moderation_outcome"),
     createdAt: timestamp("created_at")
       .$defaultFn(() => new Date())
       .notNull(),

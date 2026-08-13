@@ -9,6 +9,30 @@ import {
   SUBSCRIPTION_PLANS,
 } from "@/types/domain";
 
+/**
+ * `z.string().url()` delegates to the URL constructor, which accepts ANY scheme —
+ * `javascript:`, `data:` and `file:` all pass. A persisted asset URL is rendered
+ * or followed later, so the scheme must be constrained where it is stored.
+ * HTTPS only, with HTTP permitted in development for local asset servers.
+ */
+export const safeSourceUrl = z
+  .string()
+  .trim()
+  .url()
+  .refine(
+    (value) => {
+      let parsed: URL;
+      try {
+        parsed = new URL(value);
+      } catch {
+        return false;
+      }
+      if (parsed.protocol === "https:") return true;
+      return parsed.protocol === "http:" && process.env.NODE_ENV !== "production";
+    },
+    { message: "Source URL must use https (http is allowed only in development)" },
+  );
+
 export const paginationSchema = z.object({
   page: z.coerce.number().int().positive().default(1),
   pageSize: z.coerce.number().int().positive().max(50).default(12),
@@ -307,7 +331,7 @@ export const contentAssetCreateSchema = z.object({
   description: z.string().trim().min(10).max(1000),
   kind: z.enum(["video", "audio", "document", "image", "interactive", "scorm", "h5p", "template"]),
   status: z.enum(["draft", "review", "approved", "published", "archived"]).default("draft"),
-  sourceUrl: z.string().trim().url().optional().or(z.literal("")),
+  sourceUrl: safeSourceUrl.optional().or(z.literal("")),
   tags: z.array(z.string().trim().min(1).max(40)).max(16).default([]),
   metadata: z.record(z.string(), z.unknown()).default({}),
 });

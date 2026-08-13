@@ -969,12 +969,16 @@ export async function getOrganizationDashboard(user: User) {
   const rosterOrgIds = context.memberships
     .filter((membership) => ["owner", "admin", "teacher"].includes(membership.role))
     .map((membership) => membership.organizationId);
+  // §18/§13: only an ACTIVE relationship grants learner visibility. A PENDING
+  // link (the default for new rows) and a REVOKED link grant nothing — access is
+  // never inferred from row existence.
   const guardianLinks = await db
     .select()
     .from(guardianLearners)
     .where(
       and(
         eq(guardianLearners.guardianUserId, user.id),
+        eq(guardianLearners.status, "ACTIVE"),
         inArray(guardianLearners.organizationId, orgIds),
       ),
     );
