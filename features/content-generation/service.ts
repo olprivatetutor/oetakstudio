@@ -3,6 +3,12 @@ import type { z } from "zod";
 import { db } from "@/db";
 import { aiGenerationJobs, aiUsageRecords } from "@/db/schema/learning";
 import { createAiProviderChain } from "@/lib/ai/factory";
+import { createModerationProvider } from "@/lib/ai/moderation";
+import {
+  assertAiFeatureAllowed,
+  providerSafetyIdentifier,
+  safetyPromptSection,
+} from "@/lib/ai/safety";
 import { AppError } from "@/lib/api/response";
 import { getOrganizationMembership } from "@/lib/permissions";
 import { getAppAdmin } from "@/lib/services/app-admin";
@@ -77,6 +83,11 @@ export async function generateCourseDraft(user: User, input: GenerationInput) {
   await assertGenerationAccess(user, input.organizationId);
   await assertGenerationRateLimit(user.id);
 
+  // §12.11 lists `generation` as a feature the safety profile applies to, so it
+  // passes through the same boundary as the Tutor rather than resolving age or
+  // consent independently.
+  const safety = await assertAiFeatureAllowed(user.id, "course_generation");
+
   const [job] = await db
     .insert(aiGenerationJobs)
     .values({
@@ -89,17 +100,47 @@ export async function generateCourseDraft(user: User, input: GenerationInput) {
     .returning();
 
   const errors: string[] = [];
+  let moderationOutcome: string | null = safety.isMinor ? "output:pending" : null;
   try {
     for (const provider of createAiProviderChain()) {
       try {
         const generation = await provider.generate({
-          systemPrompt: "You are an expert instructional designer. Return valid JSON only.",
+          systemPrompt: [
+            "You are an expert instructional designer. Return valid JSON only.",
+            safetyPromptSection(safety),
+          ]
+            .filter(Boolean)
+            .join("\n\n"),
           messages: [{ role: "user", content: generationPrompt(input) }],
           temperature: 0.2,
           maxTokens: 12_000,
-          safetyIdentifier: user.id,
+          // Pseudonymous, matching the Tutor — never the raw internal user id.
+          safetyIdentifier: providerSafetyIdentifier(user.id),
         });
         const parsed = aiGeneratedCourseSchema.parse(parseJsonResponse(generation.text));
+
+        // Output moderation for minor-facing profiles, before the draft is
+        // created. A flagged generation fails the job — it is never persisted as
+        // course content, and nothing is published either way.
+        if (safety.outputModerationRequired) {
+          const moderator = createModerationProvider();
+          const verdict = await moderator.moderate(
+            [parsed.title, parsed.description, ...parsed.modules.map((m) => `${m.title} ${m.content}`)]
+              .filter(Boolean)
+              .join("\n"),
+            { minorFacing: safety.isMinor },
+          );
+          if (verdict.flagged) {
+            moderationOutcome = `output:${verdict.categories.join("|")}`;
+            throw new AppError(
+              "VALIDATION_ERROR",
+              "The generated course draft did not pass content moderation and was discarded",
+              422,
+              { moderation: verdict.categories, safetyProfile: safety.profileId },
+            );
+          }
+          moderationOutcome = "output:clean";
+        }
         const uniqueSuffix = job.id.slice(0, 8);
         const result = await createCourse(user, {
           ...parsed,
@@ -138,10 +179,16 @@ export async function generateCourseDraft(user: User, input: GenerationInput) {
             outputTokens: generation.outputTokens,
             costMicros: generation.costMicros,
             responseTimeMs: generation.responseTimeMs,
+            safetyProfile: safety.profileId,
+            moderationOutcome,
           }),
         ]);
         return { jobId: job.id, course: result.course };
       } catch (error) {
+        // A content-moderation rejection is not a provider failure: retrying the
+        // same prompt against the next provider would be an attempt to launder
+        // blocked content. Fail the job instead.
+        if (error instanceof AppError && error.status === 422) throw error;
         errors.push(error instanceof Error ? error.message : "Provider failed");
       }
     }

@@ -1,5 +1,7 @@
+import { createHash } from "node:crypto";
 import { and, eq, inArray, isNull } from "drizzle-orm";
 import { db } from "@/db";
+import { AppError } from "@/lib/api/response";
 import { user } from "@/db/schema/auth";
 import {
   consentRecords,
@@ -45,7 +47,12 @@ export type SafetyProfile = {
   isMinor: boolean;
   /** Stable id recorded on ai_usage_records so a past response can be explained. */
   profileId: string;
-  tutorAllowed: boolean;
+  /**
+   * §3.6 gates "AI features" as a class, not one endpoint. Named for the whole
+   * class deliberately: an earlier `tutorAllowed` invited exactly the mistake of
+   * gating the Tutor and leaving Speech-to-Text and Text-to-Speech open.
+   */
+  aiFeaturesAllowed: boolean;
   consentRequired: boolean;
   consentSatisfied: boolean;
   consentBasis: "GUARDIAN" | "INSTITUTIONAL" | null;
@@ -177,7 +184,7 @@ export async function resolveSafetyProfile(userId: string): Promise<SafetyProfil
     ? await resolveAiConsent(userId)
     : { satisfied: false, basis: null as SafetyProfile["consentBasis"] };
 
-  const tutorAllowed = consentRequired ? consent.satisfied : true;
+  const aiFeaturesAllowed = consentRequired ? consent.satisfied : true;
 
   return {
     ageBand,
@@ -185,7 +192,7 @@ export async function resolveSafetyProfile(userId: string): Promise<SafetyProfil
     isMinor,
     // Versioned so a stored value keeps its meaning if the rules later change.
     profileId: `${effectiveBand.toLowerCase()}-v1`,
-    tutorAllowed,
+    aiFeaturesAllowed,
     consentRequired,
     consentSatisfied: consent.satisfied,
     consentBasis: consent.basis,
@@ -195,8 +202,51 @@ export async function resolveSafetyProfile(userId: string): Promise<SafetyProfil
     // §12.11: moderation runs on BOTH input and output for minor-facing profiles.
     inputModerationRequired: isMinor,
     outputModerationRequired: isMinor,
-    denyReason: tutorAllowed ? null : "CONSENT_REQUIRED",
+    denyReason: aiFeaturesAllowed ? null : "CONSENT_REQUIRED",
   };
+}
+
+/**
+ * Learner-affecting AI capabilities. Every one of these must pass through
+ * `assertAiFeatureAllowed` before any external provider is invoked.
+ */
+export type AiFeature = "tutor" | "speech_to_text" | "text_to_speech" | "course_generation";
+
+/**
+ * The single enforcement boundary for AI features (§3.6 rule 4, §12.11).
+ *
+ * Resolves the safety profile and refuses when consent is required and absent,
+ * returning the profile so the caller can apply moderation, memory, and prompt
+ * rules and record `safety_profile` on its execution row. Age and consent logic
+ * lives here and nowhere else — routes must not re-derive it.
+ *
+ * Throws before any provider call, so a refused request never reaches a third
+ * party. §3.6 rule 4: only AI features are withheld; core learning, content and
+ * assessment remain available, so callers surface this as a scoped denial.
+ */
+export async function assertAiFeatureAllowed(
+  userId: string,
+  feature: AiFeature,
+): Promise<SafetyProfile> {
+  const profile = await resolveSafetyProfile(userId);
+  if (!profile.aiFeaturesAllowed) {
+    throw new AppError(
+      "FORBIDDEN",
+      "AI features for this account require verified guardian or institutional consent",
+      403,
+      { reason: profile.denyReason, feature, ageBand: profile.effectiveBand },
+    );
+  }
+  return profile;
+}
+
+/**
+ * Provider-facing pseudonymous identifier. Never send the raw internal user id
+ * to a third party: it is a stable cross-request handle on a real person, and
+ * for minors that is exactly the identifier §13 tells us to minimise.
+ */
+export function providerSafetyIdentifier(userId: string) {
+  return createHash("sha256").update(userId).digest("hex");
 }
 
 /**

@@ -88,7 +88,7 @@ suite("ai safety profile resolution", async (t) => {
 
     assert.equal(profile.effectiveBand, "TEEN_13_17", "UNSPECIFIED is treated as teen");
     assert.equal(profile.isMinor, true);
-    assert.equal(profile.tutorAllowed, true, "teens are permitted — this is not a denial");
+    assert.equal(profile.aiFeaturesAllowed, true, "teens are permitted — this is not a denial");
     assert.equal(profile.consentRequired, false);
     assert.equal(profile.longTermMemoryAllowed, false, "teen memory is opt-in only");
     assert.equal(profile.inputModerationRequired, true);
@@ -102,7 +102,7 @@ suite("ai safety profile resolution", async (t) => {
     assert.equal(profile.effectiveBand, "UNDER_13");
     assert.equal(profile.consentRequired, true);
     assert.equal(profile.consentSatisfied, false);
-    assert.equal(profile.tutorAllowed, false);
+    assert.equal(profile.aiFeaturesAllowed, false);
     assert.equal(profile.denyReason, "CONSENT_REQUIRED");
     assert.equal(profile.longTermMemoryAllowed, false);
   });
@@ -148,7 +148,7 @@ suite("ai safety profile resolution", async (t) => {
     );
 
     const pending = await resolveSafetyProfile(learner);
-    assert.equal(pending.tutorAllowed, false, "a PENDING guardian link must grant nothing");
+    assert.equal(pending.aiFeaturesAllowed, false, "a PENDING guardian link must grant nothing");
 
     // Accepting the relationship satisfies consent.
     await client.query(
@@ -157,7 +157,7 @@ suite("ai safety profile resolution", async (t) => {
       [learner, guardian],
     );
     const active = await resolveSafetyProfile(learner);
-    assert.equal(active.tutorAllowed, true, "UNDER_13 with valid consent is allowed");
+    assert.equal(active.aiFeaturesAllowed, true, "UNDER_13 with valid consent is allowed");
     assert.equal(active.consentBasis, "GUARDIAN");
     assert.equal(active.effectiveBand, "UNDER_13", "still the strictest profile");
     assert.equal(active.longTermMemoryAllowed, false, "no long-term memory under 13, ever");
@@ -171,7 +171,7 @@ suite("ai safety profile resolution", async (t) => {
       [learner, guardian],
     );
     const revokedLink = await resolveSafetyProfile(learner);
-    assert.equal(revokedLink.tutorAllowed, false, "a REVOKED guardian link grants nothing");
+    assert.equal(revokedLink.aiFeaturesAllowed, false, "a REVOKED guardian link grants nothing");
 
     await client.query(
       `UPDATE "guardian_learners" SET "status" = 'ACTIVE' WHERE "learner_user_id" = $1`,
@@ -187,7 +187,7 @@ suite("ai safety profile resolution", async (t) => {
     );
     const profile = await resolveSafetyProfile(learner);
     assert.equal(profile.consentSatisfied, false);
-    assert.equal(profile.tutorAllowed, false);
+    assert.equal(profile.aiFeaturesAllowed, false);
     assert.equal(profile.denyReason, "CONSENT_REQUIRED");
   });
 
@@ -199,7 +199,7 @@ suite("ai safety profile resolution", async (t) => {
       [`c-${randomUUID()}`, learner],
     );
     const profile = await resolveSafetyProfile(learner);
-    assert.equal(profile.tutorAllowed, false, "a minor cannot consent for themselves");
+    assert.equal(profile.aiFeaturesAllowed, false, "a minor cannot consent for themselves");
   });
 
   await t.test("a consent record of the wrong type does not unlock AI", async () => {
@@ -211,7 +211,7 @@ suite("ai safety profile resolution", async (t) => {
       [`c-${randomUUID()}`, learner, guardian],
     );
     const profile = await resolveSafetyProfile(learner);
-    assert.equal(profile.tutorAllowed, false, "DATA_PROCESSING is not AI_FEATURES consent");
+    assert.equal(profile.aiFeaturesAllowed, false, "DATA_PROCESSING is not AI_FEATURES consent");
   });
 
   await t.test("8. the adult flow is unchanged", async () => {
@@ -220,7 +220,7 @@ suite("ai safety profile resolution", async (t) => {
 
     assert.equal(profile.effectiveBand, "ADULT");
     assert.equal(profile.isMinor, false);
-    assert.equal(profile.tutorAllowed, true);
+    assert.equal(profile.aiFeaturesAllowed, true);
     assert.equal(profile.consentRequired, false);
     assert.equal(profile.longTermMemoryAllowed, true, "adults keep conversation memory");
     assert.equal(profile.inputModerationRequired, false);
@@ -231,7 +231,7 @@ suite("ai safety profile resolution", async (t) => {
   await t.test("an unknown user fails closed to the strictest profile", async () => {
     const profile = await resolveSafetyProfile(`u-ghost-${randomUUID()}`);
     assert.equal(profile.effectiveBand, "UNDER_13");
-    assert.equal(profile.tutorAllowed, false);
+    assert.equal(profile.aiFeaturesAllowed, false);
   });
 });
 

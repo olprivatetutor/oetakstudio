@@ -5,7 +5,7 @@ import { db } from "@/db";
 import { AppError } from "@/lib/api/response";
 import { createAiProviderChain } from "@/lib/ai/factory";
 import { blockedResponseMessage, createModerationProvider } from "@/lib/ai/moderation";
-import { replayableHistory, resolveSafetyProfile, safetyPromptSection } from "@/lib/ai/safety";
+import { assertAiFeatureAllowed, replayableHistory, safetyPromptSection } from "@/lib/ai/safety";
 import { getCourseDetail } from "@/lib/services/learning";
 import {
   aiConversations,
@@ -72,7 +72,12 @@ function tutorSystemPrompt(context: {
   ].join("\n\n");
 }
 
-async function enforceAiLimits(userId: string, organizationId: string | null) {
+/**
+ * Split from a single `enforceAiLimits` so the per-user budget can be charged
+ * before moderation runs, while the organization budget — which needs the course
+ * context — is still checked once that context is resolved (NEW-15).
+ */
+export async function enforceUserAiLimit(userId: string) {
   const since = new Date(Date.now() - 60_000);
   const [{ userRequests }] = await db
     .select({ userRequests: count() })
@@ -81,20 +86,22 @@ async function enforceAiLimits(userId: string, organizationId: string | null) {
   if (userRequests >= 20) {
     throw new AppError("RATE_LIMITED", "AI request limit reached. Try again in one minute.", 429);
   }
+}
 
-  if (organizationId) {
-    const [{ tenantRequests }] = await db
-      .select({ tenantRequests: count() })
-      .from(aiUsageRecords)
-      .where(
-        and(
-          eq(aiUsageRecords.organizationId, organizationId),
-          gte(aiUsageRecords.createdAt, since),
-        ),
-      );
-    if (tenantRequests >= 200) {
-      throw new AppError("RATE_LIMITED", "Organization AI request limit reached", 429);
-    }
+export async function enforceOrganizationAiLimit(organizationId: string | null) {
+  if (!organizationId) return;
+  const since = new Date(Date.now() - 60_000);
+  const [{ tenantRequests }] = await db
+    .select({ tenantRequests: count() })
+    .from(aiUsageRecords)
+    .where(
+      and(
+        eq(aiUsageRecords.organizationId, organizationId),
+        gte(aiUsageRecords.createdAt, since),
+      ),
+    );
+  if (tenantRequests >= 200) {
+    throw new AppError("RATE_LIMITED", "Organization AI request limit reached", 429);
   }
 }
 
@@ -109,18 +116,14 @@ export async function askTutor(input: {
 
   // §12.11 / §3.6 rule 2: the safety profile is resolved BEFORE retrieval, model
   // invocation, history replay, or any persistent memory write. Everything below
-  // is gated on it.
-  const safety = await resolveSafetyProfile(input.user.id);
-  if (!safety.tutorAllowed) {
-    // §3.6 rule 4: AI features are unavailable, but core learning, content and
-    // assessment remain available — so this is a scoped denial, not an outage.
-    throw new AppError(
-      "FORBIDDEN",
-      "AI Tutor access for this account requires verified guardian or institutional consent",
-      403,
-      { reason: safety.denyReason, ageBand: safety.effectiveBand },
-    );
-  }
+  // is gated on it. Shared with STT/TTS/generation — age and consent logic lives
+  // in one place.
+  const safety = await assertAiFeatureAllowed(input.user.id, "tutor");
+
+  // The per-user request budget is enforced BEFORE moderation so that repeated
+  // blocked requests still consume it (NEW-15). The organization-level budget
+  // needs the course context and is checked once that is resolved.
+  await enforceUserAiLimit(input.user.id);
 
   const moderator = createModerationProvider();
   if (safety.inputModerationRequired) {
@@ -166,7 +169,7 @@ export async function askTutor(input: {
     throw new AppError("NOT_FOUND", "Module not found in the selected course", 404);
   }
   const organizationId = courseDetail?.course.organizationId ?? null;
-  await enforceAiLimits(input.user.id, organizationId);
+  await enforceOrganizationAiLimit(organizationId);
 
   let conversationId = input.conversationId;
   if (conversationId) {

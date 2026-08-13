@@ -3,6 +3,7 @@ import { requireUser } from "@/lib/api/session";
 import { AppError, handleRouteError, successResponse } from "@/lib/api/response";
 import { checkRateLimit } from "@/lib/api/rate-limit";
 import { createSpeechToTextProvider } from "@/lib/ai/speech/factory";
+import { assertAiFeatureAllowed } from "@/lib/ai/safety";
 
 const MAX_AUDIO_BYTES = 10 * 1024 * 1024;
 const ALLOWED_AUDIO_TYPES = new Set(["audio/webm", "audio/mpeg", "audio/mp4", "audio/wav", "audio/x-wav", "audio/ogg"]);
@@ -12,6 +13,11 @@ export async function POST(request: NextRequest) {
     const user = await requireUser();
     const rateLimit = checkRateLimit(`ai:stt:${user.id}`, { limit: 30, windowMs: 60 * 60 * 1000 });
     if (!rateLimit.allowed) throw new AppError("RATE_LIMITED", "Speech-to-text request limit reached", 429, { retryAfterMs: rateLimit.retryAfterMs });
+
+    // §3.6/§12.11: the consent gate covers AI features as a class, not just the
+    // Tutor. Resolved here, before the audio is read or any provider exists, so
+    // a minor's voice is never transmitted to a third party without consent.
+    await assertAiFeatureAllowed(user.id, "speech_to_text");
 
     const form = await request.formData();
     const file = form.get("audio");
