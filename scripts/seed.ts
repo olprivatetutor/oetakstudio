@@ -1,7 +1,14 @@
 import "dotenv/config";
+import { eq } from "drizzle-orm";
 import { hashPassword } from "@/lib/security/password";
 import { db } from "@/db";
 import { account, user } from "@/db/schema/auth";
+import {
+  membershipRoles,
+  roles,
+  workspaceMemberships,
+  workspaces,
+} from "@/db/schema/workspace";
 import {
   assessments,
   courseModules,
@@ -30,6 +37,13 @@ import {
 const now = new Date();
 const demoUserId = "11111111-1111-4111-8111-111111111111";
 const orgId = "22222222-2222-4222-8222-222222222222";
+// §4.4: one Organization Workspace per organization. organizations.workspace_id
+// is NOT NULL since migration 0011, so every seeded org needs one. Fixed ids
+// keep the seed idempotent (§14: seed data is versioned and idempotent).
+const orgWorkspaceId = "22222222-2222-4222-8222-2222222222w1";
+const maintenanceOrgWorkspaceId = "99999999-9999-4999-8999-9999999999w1";
+const scenarioOrgWorkspaceId = "10101010-1111-4111-8111-10101010w001";
+const englishSchoolOrgWorkspaceId = "71717171-1111-4111-8111-71717171w001";
 const maintenanceUserId = "99999999-9999-4999-8999-999999999991";
 const maintenanceAccountId = "99999999-9999-4999-8999-999999999992";
 const maintenanceOrgId = "99999999-9999-4999-8999-999999999993";
@@ -223,6 +237,60 @@ async function upsertCredentialUser(input: {
   });
 }
 
+/**
+ * Provisions the Organization Workspace a seeded organization requires (§4.4),
+ * with its founding ORG_OWNER membership. Mirrors the backfill in migration 0011
+ * (`workspaces.slug = 'org-' || organizations.slug`) so seeded and migrated
+ * tenants are indistinguishable. Idempotent: every write conflicts to no-op.
+ *
+ * The seed runs on the owner connection, so RLS is not the control here — this
+ * exists to satisfy the NOT NULL FK and to give seeded orgs a real membership
+ * graph, matching what lib/services/workspace.ts creates at runtime.
+ */
+async function seedOrganizationWorkspace(input: {
+  workspaceId: string;
+  name: string;
+  organizationSlug: string;
+  ownerUserId: string;
+}) {
+  await db
+    .insert(workspaces)
+    .values({
+      id: input.workspaceId,
+      type: "ORGANIZATION",
+      name: input.name,
+      slug: `org-${input.organizationSlug}`,
+      createdAt: now,
+      updatedAt: now,
+    })
+    .onConflictDoNothing();
+
+  const membershipId = `${input.workspaceId}-owner`;
+  await db
+    .insert(workspaceMemberships)
+    .values({
+      id: membershipId,
+      workspaceId: input.workspaceId,
+      userId: input.ownerUserId,
+      status: "ACTIVE",
+      joinedAt: now,
+      createdAt: now,
+      updatedAt: now,
+    })
+    .onConflictDoNothing();
+
+  const [ownerRole] = await db
+    .select({ id: roles.id })
+    .from(roles)
+    .where(eq(roles.code, "ORG_OWNER"));
+  if (ownerRole) {
+    await db
+      .insert(membershipRoles)
+      .values({ membershipId, roleId: ownerRole.id, grantedAt: now })
+      .onConflictDoNothing();
+  }
+}
+
 async function main() {
   const maintenancePasswordHash = await hashPassword(maintenancePassword);
   const contentManagerPasswordHash = await hashPassword(contentManagerPassword);
@@ -352,8 +420,16 @@ async function main() {
     },
   });
 
+  await seedOrganizationWorkspace({
+    workspaceId: maintenanceOrgWorkspaceId,
+    name: "Oetak Studio Maintenance",
+    organizationSlug: "oetak-studio-maintenance",
+    ownerUserId: maintenanceUserId,
+  });
+
   await db.insert(organizations).values({
     id: maintenanceOrgId,
+    workspaceId: maintenanceOrgWorkspaceId,
     name: "Oetak Studio Maintenance",
     slug: "oetak-studio-maintenance",
     description: "Maintenance tenant for application operations and owner-level access.",
@@ -444,8 +520,16 @@ async function main() {
     updatedAt: now,
   }).onConflictDoNothing();
 
+  await seedOrganizationWorkspace({
+    workspaceId: orgWorkspaceId,
+    name: "Tech Academy Demo",
+    organizationSlug: "tech-academy-demo",
+    ownerUserId: demoUserId,
+  });
+
   await db.insert(organizations).values({
     id: orgId,
+    workspaceId: orgWorkspaceId,
     name: "Tech Academy Demo",
     slug: "tech-academy-demo",
     description: "Sample tenant for course ownership and organization analytics.",
@@ -1086,8 +1170,16 @@ Evidence: final project presentation, peer feedback, and reflection on one speak
     });
   }
 
+  await seedOrganizationWorkspace({
+    workspaceId: englishSchoolOrgWorkspaceId,
+    name: "SMP Global Merdeka Demo",
+    organizationSlug: "smp-global-merdeka-demo",
+    ownerUserId: englishSchoolOwnerUserId,
+  });
+
   await db.insert(organizations).values({
     id: englishSchoolOrgId,
+    workspaceId: englishSchoolOrgWorkspaceId,
     name: "SMP Global Merdeka Demo",
     slug: "smp-global-merdeka-demo",
     description: "School tenant that adopts global Kurikulum Merdeka English Grade 7 content from the platform catalog.",
@@ -1324,8 +1416,16 @@ Evidence: final project presentation, peer feedback, and reflection on one speak
     });
   }
 
+  await seedOrganizationWorkspace({
+    workspaceId: scenarioOrgWorkspaceId,
+    name: "SMA Merdeka Nusantara Demo",
+    organizationSlug: "sma-merdeka-nusantara-demo",
+    ownerUserId: scenarioOwnerUserId,
+  });
+
   await db.insert(organizations).values({
     id: scenarioOrgId,
+    workspaceId: scenarioOrgWorkspaceId,
     name: "SMA Merdeka Nusantara Demo",
     slug: "sma-merdeka-nusantara-demo",
     description: "Scenario 1 school tenant using inherited Kurikulum Merdeka for Grade 11 Mathematics.",

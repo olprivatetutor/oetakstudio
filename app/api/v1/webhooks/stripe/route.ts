@@ -24,22 +24,33 @@ export async function POST(request: NextRequest) {
     verifyStripeSignature(payload, signature, secret);
     const event = JSON.parse(payload) as StripeEvent;
 
-    // §13.10/§23.1: dedupe on provider_event_id so retried deliveries never double-apply.
-    const isNewEvent = await claimWebhookEvent({
+    // §13.10/§23.1: dedupe on provider_event_id so retried deliveries never
+    // double-apply — but only a *successfully processed* event is terminal, so a
+    // failed attempt stays retryable when Stripe redelivers it.
+    const claim = await claimWebhookEvent({
       provider: "stripe",
       providerEventId: event.id,
       eventType: event.type,
       payload: event as unknown as Record<string, unknown>,
     });
-    if (!isNewEvent) {
+    if (!claim.claimed) {
       return successResponse({ received: true, eventId: event.id, deduplicated: true });
     }
 
     try {
       if (event.type === "checkout.session.completed" && event.data?.object) {
-        await applyStripeCheckoutCompleted(event.data.object);
+        const outcome = await applyStripeCheckoutCompleted(event.data.object);
+        // An unsettled payment is not a failure to retry: Stripe will send a
+        // separate async_payment_succeeded event once funds clear.
+        await markWebhookEventOutcome(
+          "stripe",
+          event.id,
+          outcome.applied ? "processed" : "ignored",
+          outcome.reason,
+        );
+      } else {
+        await markWebhookEventOutcome("stripe", event.id, "ignored", `unhandled type ${event.type}`);
       }
-      await markWebhookEventOutcome("stripe", event.id, "processed");
     } catch (error) {
       await markWebhookEventOutcome(
         "stripe",

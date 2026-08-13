@@ -3,6 +3,7 @@ import { db } from "@/db";
 import { AppError } from "@/lib/api/response";
 import { getOrganizationMembership } from "@/lib/permissions";
 import { getAppAdmin } from "@/lib/services/app-admin";
+import { organizationWorkspaceSlug, provisionWorkspace } from "@/lib/services/workspace";
 import { canReadCourse } from "@/lib/authorization/course-access";
 import { gradeAssessmentAnswers } from "@/lib/assessments/grading";
 import type { AssessmentAnswer } from "@/types/domain";
@@ -109,9 +110,21 @@ export async function saveOnboarding(user: User, input: OnboardingInput) {
     let organization = null;
 
     if (input.accountType === "organization" && input.organization) {
+      // §4.4: every organization is 1:1 with an Organization Workspace, and
+      // organizations.workspace_id is NOT NULL since 0011 — so the workspace and
+      // its founding ORG_OWNER membership must exist before the organization row.
+      const { workspace } = await provisionWorkspace(tx, {
+        type: "ORGANIZATION",
+        name: input.organization.name,
+        slug: organizationWorkspaceSlug(input.organization.slug),
+        ownerUserId: user.id,
+        roleCodes: ["ORG_OWNER"],
+      });
+
       [organization] = await tx
         .insert(organizations)
         .values({
+          workspaceId: workspace.id,
           name: input.organization.name,
           slug: input.organization.slug,
           description: input.organization.description,
@@ -448,9 +461,20 @@ export async function getCourseModuleDetail(user: User, courseId: string, module
 
 export async function createOrganization(user: User, input: OrganizationCreateInput) {
   return db.transaction(async (tx) => {
+  // See saveOnboarding: the Organization Workspace is provisioned first because
+  // organizations.workspace_id is NOT NULL (§4.4, migration 0011).
+  const { workspace } = await provisionWorkspace(tx, {
+    type: "ORGANIZATION",
+    name: input.name,
+    slug: organizationWorkspaceSlug(input.slug),
+    ownerUserId: user.id,
+    roleCodes: ["ORG_OWNER"],
+  });
+
   const [organization] = await tx
     .insert(organizations)
     .values({
+      workspaceId: workspace.id,
       name: input.name,
       slug: input.slug,
       description: input.description,

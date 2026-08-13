@@ -92,6 +92,13 @@
       "when": 1786000200000,
       "tag": "0012_rls_workspace_hardening",
       "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1786000300000,
+      "tag": "0013_rls_membership_authorization",
+      "breakpoints": true
     }
   ]
 }

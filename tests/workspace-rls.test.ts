@@ -71,6 +71,18 @@ async function expectRlsViolation(promise: Promise<unknown>, what: string) {
   );
 }
 
+// A skipped security suite must never read as a pass. When RLS_TEST_DATABASE_URL
+// is absent the suite still reports as skipped to node:test, but it says so
+// loudly on stderr so CI output cannot be mistaken for "isolation verified".
+// When the variable IS set, the suite must run — never silently degrade to skip.
+if (!ownerUrl) {
+  console.error(
+    "\n!! RLS isolation tests SKIPPED: RLS_TEST_DATABASE_URL is not set.\n" +
+      "!! Workspace isolation is NOT verified by this run. See the header of\n" +
+      "!! tests/workspace-rls.test.ts for the setup commands.\n",
+  );
+}
+
 const suite = ownerUrl ? test : test.skip;
 
 suite("workspace RLS isolation", async (t) => {
@@ -89,9 +101,27 @@ suite("workspace RLS isolation", async (t) => {
     memB: `m-b-${randomUUID()}`,
   };
 
-  await owner.query("ALTER ROLE app_rw WITH PASSWORD $1", [RUNTIME_TEST_PASSWORD]);
+  // Registered before the fixtures run: if a fixture throws, this connection
+  // must still be closed or the test process hangs instead of reporting.
+  t.after(async () => {
+    await owner.query(`DELETE FROM "workspaces" WHERE "id" = ANY($1)`, [[ids.wsA, ids.wsB]]);
+    await owner.query(`DELETE FROM "user" WHERE "id" = ANY($1)`, [[ids.userA, ids.userB]]);
+    await owner.end();
+  });
+
+  // ALTER ROLE does not accept bind parameters, so the literal is escaped and
+  // inlined. RUNTIME_TEST_PASSWORD is a compile-time constant, not input.
   await owner.query(
-    `INSERT INTO "user" ("id","name","email","email_verified") VALUES ($1,'A',$3,true),($2,'B',$4,true)`,
+    `ALTER ROLE app_rw WITH PASSWORD '${RUNTIME_TEST_PASSWORD.replace(/'/g, "''")}'`,
+  );
+  // `user` predates the workspace tables and has no database-side default for
+  // created_at/updated_at (Drizzle fills them via $defaultFn in application
+  // code), so raw SQL fixtures must set them or the insert fails with 23502.
+  // userB carries a minor birth_date so the PII isolation tests have a subject.
+  await owner.query(
+    `INSERT INTO "user" ("id","name","email","email_verified","birth_date","age_band","created_at","updated_at")
+     VALUES ($1,'A',$3,true,'1990-01-01','ADULT',now(),now()),
+            ($2,'B',$4,true,'2016-05-05','UNDER_13',now(),now())`,
     [ids.userA, ids.userB, `${ids.userA}@example.test`, `${ids.userB}@example.test`],
   );
   await owner.query(
@@ -110,12 +140,6 @@ suite("workspace RLS isolation", async (t) => {
   );
 
   const url = runtimeUrl(ownerUrl!);
-
-  t.after(async () => {
-    await owner.query(`DELETE FROM "workspaces" WHERE "id" = ANY($1)`, [[ids.wsA, ids.wsB]]);
-    await owner.query(`DELETE FROM "user" WHERE "id" = ANY($1)`, [[ids.userA, ids.userB]]);
-    await owner.end();
-  });
 
   await t.test("runtime role cannot bypass RLS", async () => {
     const { rows } = await owner.query(
@@ -224,11 +248,163 @@ suite("workspace RLS isolation", async (t) => {
   await t.test("pinning a workspace without membership reads nothing", async () => {
     // Defense in depth: the application must validate membership before SET
     // LOCAL, but a forged workspace id must not read that workspace either.
+    // Covers all three tables — before 0013, memberships and membership_roles
+    // trusted the pin alone and returned the victim workspace's full roster.
     const rows = await asRuntime(url, { userId: ids.userA, workspaceId: ids.wsB }, async (c) => {
       const w = await c.query(`SELECT "id" FROM "workspaces"`);
+      const m = await c.query(`SELECT "id" FROM "workspace_memberships"`);
+      const r = await c.query(`SELECT "membership_id" FROM "membership_roles"`);
+      assert.equal(m.rowCount, 0, "pinning alone must not expose a roster");
+      assert.equal(r.rowCount, 0, "pinning alone must not expose role grants");
       return w.rowCount;
     });
     assert.equal(rows, 0);
+  });
+
+  await t.test("P0-1 regression: the workspace takeover chain fails at step one", async () => {
+    // Reproduces the exact chain from the Phase 1 security review against
+    // 0012's `workspace_memberships_insert`, whose unpinned branch constrained
+    // user_id but NOT workspace_id:
+    //
+    //   unpinned self-join into victim workspace -> victim workspace becomes
+    //   visible -> pin it -> read the roster -> self-grant ORG_OWNER -> evict
+    //   the legitimate owner -> mutate the workspace.
+    //
+    // The whole chain hinges on that first insert, so that is what must fail.
+    const forgedMembership = `m-forged-${randomUUID()}`;
+
+    await expectRlsViolation(
+      asRuntime(url, { userId: ids.userA, workspaceId: null }, (c) =>
+        c.query(
+          `INSERT INTO "workspace_memberships" ("id","workspace_id","user_id","status") VALUES ($1,$2,$3,'ACTIVE')`,
+          [forgedMembership, ids.wsB, ids.userA],
+        ),
+      ),
+      "unpinned self-join into a workspace the caller does not belong to",
+    );
+
+    // Nothing was written, so every later link in the chain has nothing to
+    // stand on. Assert the post-conditions the attacker was aiming for.
+    const { rows: forged } = await owner.query(
+      `SELECT count(*)::int AS n FROM "workspace_memberships" WHERE "id" = $1`,
+      [forgedMembership],
+    );
+    assert.equal(forged[0].n, 0, "no membership row may exist after the blocked insert");
+
+    const visible = await asRuntime(url, { userId: ids.userA, workspaceId: null }, async (c) =>
+      (await c.query(`SELECT "id" FROM "workspaces"`)).rows.map((r) => r.id),
+    );
+    assert.deepEqual(visible, [ids.wsA], "the victim workspace must not have become visible");
+
+    // Pinning it anyway must still yield nothing, and self-granting ORG_OWNER
+    // on the victim's own membership must be refused.
+    const ownerRoleId = (await owner.query(`SELECT "id" FROM "roles" WHERE "code" = 'ORG_OWNER'`))
+      .rows[0].id as string;
+    await expectRlsViolation(
+      asRuntime(url, { userId: ids.userA, workspaceId: ids.wsB }, (c) =>
+        c.query(`INSERT INTO "membership_roles" ("membership_id","role_id") VALUES ($1,$2)`, [
+          ids.memB,
+          ownerRoleId,
+        ]),
+      ),
+      "self-granting ORG_OWNER in a workspace the caller merely pinned",
+    );
+
+    const evicted = await asRuntime(url, { userId: ids.userA, workspaceId: ids.wsB }, async (c) =>
+      (await c.query(`UPDATE "workspace_memberships" SET "status" = 'REMOVED' WHERE "id" = $1`, [
+        ids.memB,
+      ])).rowCount,
+    );
+    assert.equal(evicted, 0, "the legitimate member must not be evictable");
+
+    const renamed = await asRuntime(url, { userId: ids.userA, workspaceId: ids.wsB }, async (c) =>
+      (await c.query(`UPDATE "workspaces" SET "name" = 'pwned' WHERE "id" = $1`, [ids.wsB])).rowCount,
+    );
+    assert.equal(renamed, 0, "the victim workspace must not be mutable");
+
+    const { rows: after } = await owner.query(`SELECT "name" FROM "workspaces" WHERE "id" = $1`, [
+      ids.wsB,
+    ]);
+    assert.equal(after[0].name, "B", "victim workspace state must be untouched");
+  });
+
+  await t.test("bootstrap: a caller may claim only a workspace with no members", async () => {
+    // The legitimate case the removed unpinned branch existed to serve. It must
+    // still work, or registration/organization creation breaks — but only for a
+    // workspace that has no memberships at all, and only for the caller
+    // themselves, which is what lib/services/workspace.ts does.
+    const freshWs = `w-boot-${randomUUID()}`;
+    const freshMem = `m-boot-${randomUUID()}`;
+
+    await asRuntime(url, { userId: ids.userA, workspaceId: null }, async (c) => {
+      await c.query(
+        `INSERT INTO "workspaces" ("id","type","name","slug") VALUES ($1,'ORGANIZATION','Boot',$2)`,
+        [freshWs, `slug-${freshWs}`],
+      );
+      // provisionWorkspace pins the new workspace here, before the membership.
+      await c.query("select set_config('app.current_workspace_id', $1, true)", [freshWs]);
+      await c.query(
+        `INSERT INTO "workspace_memberships" ("id","workspace_id","user_id","status") VALUES ($1,$2,$3,'ACTIVE')`,
+        [freshMem, freshWs, ids.userA],
+      );
+      const ownerRoleId = (await c.query(`SELECT "id" FROM "roles" WHERE "code" = 'ORG_OWNER'`))
+        .rows[0].id as string;
+      await c.query(`INSERT INTO "membership_roles" ("membership_id","role_id") VALUES ($1,$2)`, [
+        freshMem,
+        ownerRoleId,
+      ]);
+    });
+
+    const { rows } = await owner.query(
+      `SELECT count(*)::int AS n FROM "workspace_memberships" WHERE "id" = $1`,
+      [freshMem],
+    );
+    assert.equal(rows[0].n, 1, "bootstrap of a newly created workspace must still succeed");
+
+    // Once claimed, the same shape must no longer work for anyone else.
+    await expectRlsViolation(
+      asRuntime(url, { userId: ids.userB, workspaceId: freshWs }, (c) =>
+        c.query(
+          `INSERT INTO "workspace_memberships" ("id","workspace_id","user_id","status") VALUES ($1,$2,$3,'ACTIVE')`,
+          [`m-x-${randomUUID()}`, freshWs, ids.userB],
+        ),
+      ),
+      "self-joining a workspace that already has members",
+    );
+
+    await owner.query(`DELETE FROM "workspaces" WHERE "id" = $1`, [freshWs]);
+  });
+
+  await t.test("P1-4: user PII is not readable across workspaces", async () => {
+    // 0012 granted blanket SELECT on "user" with no RLS, so any workspace
+    // context could read every user's birth_date and age_band.
+    await assert.rejects(
+      asRuntime(url, { userId: ids.userA, workspaceId: ids.wsA }, (c) =>
+        c.query(`SELECT "birth_date" FROM "user" WHERE "id" = $1`, [ids.userB]),
+      ),
+      /permission denied/i,
+      "birth_date must not be selectable by the runtime role at all",
+    );
+
+    await assert.rejects(
+      asRuntime(url, { userId: ids.userA, workspaceId: ids.wsA }, (c) =>
+        c.query(`SELECT "age_band" FROM "user" WHERE "id" = $1`, [ids.userB]),
+      ),
+      /permission denied/i,
+      "age_band must go through the privileged safety-profile path",
+    );
+
+    // Even the granted columns must not expose an unrelated tenant's users.
+    const leaked = await asRuntime(url, { userId: ids.userA, workspaceId: ids.wsA }, async (c) =>
+      (await c.query(`SELECT "id" FROM "user" WHERE "id" = $1`, [ids.userB])).rowCount,
+    );
+    assert.equal(leaked, 0, "a user in another workspace must not be readable");
+
+    // Self is always readable, and so are co-members of the pinned workspace.
+    const self = await asRuntime(url, { userId: ids.userA, workspaceId: ids.wsA }, async (c) =>
+      (await c.query(`SELECT "id","name","email" FROM "user" WHERE "id" = $1`, [ids.userA])).rowCount,
+    );
+    assert.equal(self, 1, "a caller must be able to read their own user row");
   });
 
   await t.test("cross-workspace writes are blocked", async () => {
@@ -248,6 +424,7 @@ suite("workspace RLS isolation", async (t) => {
           ids.wsB,
           ids.memA,
         ]),
+      ),
       "moving a membership into another workspace",
     );
 
@@ -257,6 +434,7 @@ suite("workspace RLS isolation", async (t) => {
           `w-x-${randomUUID()}`,
           ids.wsA,
         ]),
+      ),
       "updating a workspace row out of the pinned workspace",
     );
   });
@@ -303,6 +481,7 @@ suite("workspace RLS isolation", async (t) => {
           ids.memA,
           ownerRoleId,
         ]),
+      ),
       "granting a role with no workspace pinned",
     );
 
@@ -312,6 +491,7 @@ suite("workspace RLS isolation", async (t) => {
           ids.memB,
           ownerRoleId,
         ]),
+      ),
       "granting a role on another workspace's membership",
     );
   });
@@ -356,6 +536,7 @@ suite("workspace RLS isolation", async (t) => {
           ids.userA,
           superAdminId,
         ]),
+      ),
       /permission denied/i,
       "the runtime role must not be able to grant itself SUPER_ADMIN",
     );
